@@ -407,11 +407,23 @@ require('lazy').setup({
         -- You can put your default mappings / updates / etc. in here
         --  All the info you're looking for is in `:help telescope.setup()`
         --
-        -- defaults = {
-        --   mappings = {
-        --     i = { ['<c-enter>'] = 'to_fuzzy_refine' },
-        --   },
-        -- },
+        defaults = {
+          layout_strategy = 'vertical', -- Ensures horizontal split
+          layout_config = {
+            vertical = {
+              preview_width = 0.6, -- Adjust preview width (0-1)
+              preview_cutoff = 1, -- Never hide preview
+              height = 0.9, -- Use 90% of terminal height
+              width = 0.9, -- Use 90% of terminal width
+              prompt_position = 'top', -- Search bar at the top
+              preview_height = 0.5, -- Preview takes 50% of space
+            },
+          },
+          preview = {
+            timeout = 500, -- Adjust if preview is slow
+            msg_bg_fillchar = ' ', -- Cleaner preview background
+          },
+        },
         -- pickers = {}
         extensions = {
           ['ui-select'] = {
