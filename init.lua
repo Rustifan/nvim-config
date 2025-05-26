@@ -443,6 +443,10 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>sh', builtin.help_tags, { desc = '[S]earch [H]elp' })
       vim.keymap.set('n', '<leader>sk', builtin.keymaps, { desc = '[S]earch [K]eymaps' })
       vim.keymap.set('n', '<leader>sf', builtin.find_files, { desc = '[S]earch [F]iles' })
+
+      vim.keymap.set('n', '<leader>fh', function()
+        require('telescope.builtin').find_files { hidden = true, no_ignore = true }
+      end, { desc = 'Find hidden files' })
       vim.keymap.set('n', '<leader>ss', builtin.builtin, { desc = '[S]earch [S]elect Telescope' })
       vim.keymap.set('n', '<leader>sw', builtin.grep_string, { desc = '[S]earch current [W]ord' })
       vim.keymap.set('n', '<leader>sg', builtin.live_grep, { desc = '[S]earch by [G]rep' })
@@ -540,6 +544,13 @@ require('lazy').setup({
       --    That is to say, every time a new file is opened that is associated with
       --    an lsp (for example, opening `main.rs` is associated with `rust_analyzer`) this
       --    function will be executed to configure the current buffer
+      require('lspconfig').flow.setup {
+        --flow-path /Users/ivan/.nvm/versions/node/v22.14.0/bin/flow
+        cmd = { 'flow', 'lsp' },
+        filetypes = { 'javascript', 'javascriptreact' },
+        root_dir = require('lspconfig.util').root_pattern '.flowconfig',
+      }
+
       vim.api.nvim_create_autocmd('LspAttach', {
         group = vim.api.nvim_create_augroup('kickstart-lsp-attach', { clear = true }),
         callback = function(event)
@@ -756,10 +767,21 @@ require('lazy').setup({
       }
     end,
   },
+
   {
     'pmizio/typescript-tools.nvim',
     dependencies = { 'nvim-lua/plenary.nvim', 'neovim/nvim-lspconfig' },
     opts = {
+      on_attach = function(client, bufnr)
+        local util = require 'lspconfig.util'
+        local root_dir = util.root_pattern '.flowconfig'(vim.api.nvim_buf_get_name(bufnr))
+        if root_dir then
+          client.stop()
+          return
+        end
+
+        -- Your existing on_attach code...
+      end,
       settings = {
         tsserver_file_preferences = {},
       },
