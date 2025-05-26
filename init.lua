@@ -208,16 +208,6 @@ vim.keymap.set('n', '<leader>cr', '<cmd>CopilotChatReset<CR>', { desc = 'Copilot
 vim.keymap.set('v', '<leader>ce', ':CopilotChatExplain<CR>', { desc = 'CopilotChat: Explain selection' })
 vim.keymap.set('v', '<leader>cf', ':CopilotChatFix<CR>', { desc = 'CopilotChat: Fix selection' })
 -- Toggle Copilot
-vim.keymap.set('n', '<leader>ct', function()
-  local status = vim.g.copilot_enabled or false
-  if status then
-    vim.cmd 'Copilot disable'
-    vim.g.copilot_enabled = false
-  else
-    vim.cmd 'Copilot enable'
-    vim.g.copilot_enabled = true
-  end
-end, { desc = 'Copilot: Toggle enable/disable' })
 --  See `:help lua-guide-autocommands`
 -- Highlight when yanking (copying) text
 --  Try it with `yap` in normal mode
@@ -259,11 +249,51 @@ rtp:prepend(lazypath)
 require('lazy').setup({
   -- NOTE: Plugins can be added with a link (or for a github repo: 'owner/repo' link).
   'NMAC427/guess-indent.nvim', -- Detect tabstop and shiftwidth automatically
-  'github/copilot.vim',
+  {
+    'github/copilot.vim',
+    config = function()
+      -- Path to the state file
+      local state_file = vim.fn.stdpath 'data' .. '/copilot_enabled'
 
-  -- NOTE: Plugins can also be added by using a table,
-  -- with the first argument being the link and the following
-  -- keys can be used to configure plugin behavior/loading/etc.
+      -- Read persisted state
+      local function read_state()
+        if vim.fn.filereadable(state_file) == 1 then
+          local content = vim.fn.readfile(state_file)
+          if content and content[1] == '1' then
+            return true
+          end
+        end
+        return false
+      end
+
+      -- Persist state to file
+      local function save_state(state)
+        local val = state and '1' or '0'
+        vim.fn.writefile({ val }, state_file)
+      end
+
+      -- Set Copilot state if needed
+      local function set_copilot(state)
+        if state then
+          vim.cmd 'Copilot enable'
+        else
+          vim.cmd 'Copilot disable'
+        end
+        vim.g.copilot_enabled = state
+        save_state(state)
+      end
+
+      -- Initialize Copilot state
+      local enabled = read_state()
+      set_copilot(enabled)
+
+      -- Toggle keymap
+      vim.keymap.set('n', '<leader>ct', function()
+        local status = vim.g.copilot_enabled or false
+        set_copilot(not status)
+      end, { desc = 'Copilot: Toggle enable/disable' })
+    end,
+  },
   --
   -- Use `opts = {}` to automatically pass options to a plugin's `setup()` function, forcing the plugin to be loaded.
   --
