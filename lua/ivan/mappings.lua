@@ -39,3 +39,17 @@ vim.api.nvim_create_autocmd('TextYankPost', {
   end,
 })
 
+vim.api.nvim_create_user_command('DiffOrig', function()
+  local orig_ft = vim.bo.filetype
+  vim.cmd [[
+    vnew | set bt=nofile | r ++edit # | 0d_
+  ]]
+  vim.bo.filetype = orig_ft
+  vim.cmd 'diffthis'
+  vim.cmd 'wincmd p | diffthis'
+end, {})
+
+
+vim.api.nvim_create_user_command('Ex', function(opts)
+  vim.cmd('Oil ' .. opts.args)
+end, { nargs = '*' })
