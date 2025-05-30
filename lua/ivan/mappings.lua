@@ -1,6 +1,5 @@
 vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
 
-
 vim.keymap.set('n', '<leader>q', vim.diagnostic.setloclist, { desc = 'Open diagnostic [Q]uickfix list' })
 vim.keymap.set('n', '<leader>e', vim.diagnostic.open_float, { desc = 'Open [E]rror float' })
 vim.keymap.set('t', '<Esc><Esc>', '<C-\\><C-n>', { desc = 'Exit terminal mode' })
@@ -39,6 +38,20 @@ vim.api.nvim_create_autocmd('TextYankPost', {
   end,
 })
 
+vim.keymap.set('n', '<leader>rp', function()
+  local path = vim.fn.expand '%:.'
+  vim.fn.setreg('+', path)
+  vim.notify('Copied relative path: ' .. path)
+end, { desc = 'Copy [R]elative file [P]ath to clipboard' })
+
+vim.keymap.set('n', '<leader>rl', function()
+  local line_number = vim.fn.line '.'
+  local path = vim.fn.expand '%:.'
+  local full_path = path .. ':' .. line_number
+  vim.fn.setreg('+', full_path)
+  vim.notify('Copied path and line nunber: ' .. full_path)
+end, { desc = 'Copy [R]eference to a [L]ine number and path' })
+
 vim.api.nvim_create_user_command('DiffOrig', function()
   local orig_ft = vim.bo.filetype
   vim.cmd [[
@@ -48,7 +61,6 @@ vim.api.nvim_create_user_command('DiffOrig', function()
   vim.cmd 'diffthis'
   vim.cmd 'wincmd p | diffthis'
 end, {})
-
 
 vim.api.nvim_create_user_command('Ex', function(opts)
   vim.cmd('Oil ' .. opts.args)
