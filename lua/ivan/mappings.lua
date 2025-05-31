@@ -8,6 +8,7 @@ vim.keymap.set('t', '<Esc><Esc>', '<C-\\><C-n>', { desc = 'Exit terminal mode' }
 vim.keymap.set('n', '<leader>se', ':Telescope file_browser path=%:p:h select_buffer=true<CR>', { desc = '[S]earch [S]elect File Explorer' })
 vim.keymap.set('n', '<leader>st', ':Telescope telescope-tabs list_tabs<CR>', { desc = '[S]earch [T]abs' })
 
+vim.keymap.set('n', '<leader>l', '<C-^>', { desc = 'Toggle between [L]ast two buffers' })
 -- Disable arrows
 vim.keymap.set('n', '<left>', '<cmd>echo "Use h to move!!"<CR>')
 vim.keymap.set('n', '<right>', '<cmd>echo "Use l to move!!"<CR>')
