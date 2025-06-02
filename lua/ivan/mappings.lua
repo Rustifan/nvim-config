@@ -66,3 +66,4 @@ end, {})
 vim.api.nvim_create_user_command('Ex', function(opts)
   vim.cmd('Oil ' .. opts.args)
 end, { nargs = '*' })
+
