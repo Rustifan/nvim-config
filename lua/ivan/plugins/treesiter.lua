@@ -5,7 +5,7 @@ return {
     main = 'nvim-treesitter.configs', -- Sets main module to use for opts
     -- [[ Configure Treesitter ]] See `:help nvim-treesitter`
     opts = {
-      ensure_installed = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc', 'php' },
+      ensure_installed = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc', 'php', 'javascript', 'typescript', 'xml' },
       -- Autoinstall languages that are not installed
       auto_install = true,
       highlight = {
@@ -17,6 +17,26 @@ return {
       },
       indent = { enable = true, disable = { 'ruby' } },
     },
+    config = function(_, opts)
+      -- Setup treesitter with the options
+      require('nvim-treesitter.configs').setup(opts)
+      
+      -- Auto-detect Flow files and use TypeScript parser
+      vim.api.nvim_create_autocmd({"BufRead", "BufNewFile"}, {
+        pattern = "*.js",
+        callback = function()
+          local lines = vim.api.nvim_buf_get_lines(0, 0, 10, false)
+          local content = table.concat(lines, "\n")
+          
+          -- Check for Flow pragma or Flow syntax
+          if content:match("@flow") or 
+             content:match(":%s*[%w<>%[%]|]+%s*[=,;)]") or  -- type annotations
+             content:match("type%s+%w+%s*=") then           -- type definitions
+            vim.treesitter.language.register('typescript', vim.bo.filetype)
+          end
+        end,
+      })
+    end,
     -- There are additional nvim-treesitter modules that you can use to interact
     -- with nvim-treesitter. You should go explore a few and see what interests you:
     --
