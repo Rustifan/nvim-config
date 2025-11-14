@@ -34,5 +34,5 @@ vim.o.confirm = true
 vim.o.expandtab = true
 vim.o.smartindent = true
 -- spelling
-vim.o.spell = true
-vim.o.spelllang = 'en_us'
+-- vim.o.spell = true
+-- vim.o.spelllang = 'en_us'

@@ -137,7 +137,7 @@ return {
         clangd = {},
         gopls = {},
         terraformls = {}, 
-        csharp_ls = {},
+        omnisharp = {},
         lua_ls = {
           settings = {
             Lua = {
