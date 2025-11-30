@@ -21,19 +21,26 @@ return {
         -- languages here or re-enable it for the disabled ones.
         local disable_filetypes = { c = true, cpp = true, javascript = true, typescript = true }
 
-        print(vim.bo[bufnr].filetype)
         if disable_filetypes[vim.bo[bufnr].filetype] then
           return nil
         else
-          return nil
-          -- return {
-          --   timeout_ms = 500,
-          --   lsp_format = 'fallback',
-          -- }
+          return {
+            timeout_ms = 500,
+            lsp_format = 'fallback',
+          }
         end
       end,
+      formatters = {
+        ['clang-format'] = {
+          prepend_args = {
+            '--style={BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 100, BreakBeforeBraces: Allman, AllowShortFunctionsOnASingleLine: None, AllowShortIfStatementsOnASingleLine: Never, PointerAlignment: Left, UseTab: Never}',
+          },
+        },
+      },
       formatters_by_ft = {
         lua = { 'stylua' },
+        c = { 'clang-format' },
+        cpp = { 'clang-format' },
         -- Conform can also run multiple formatters sequentially
         -- python = { "isort", "black" },
         --
