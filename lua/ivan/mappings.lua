@@ -67,3 +67,82 @@ vim.api.nvim_create_user_command('Ex', function(opts)
   vim.cmd('Oil ' .. opts.args)
 end, { nargs = '*' })
 
+-- Mongo migration runner
+local function run_mongosh(input, is_file)
+  local code
+  if is_file then
+    local lines = vim.fn.readfile(input)
+    code = table.concat(lines, '\n')
+  else
+    code = input
+  end
+
+  -- Strip trailing semicolons and whitespace, then wrap with printjson
+  code = code:gsub('%s*;%s*$', '')
+  local wrapped = 'printjson(' .. code .. ')'
+  local cmd = { 'mongosh', 'mongodb://localhost/kompare-platform', '--norc', '--quiet', '--eval', wrapped }
+  local env = { NO_COLOR = '1' }
+
+  local output = {}
+
+  vim.fn.jobstart(cmd, {
+    env = env,
+    pty = true,
+    on_stdout = function(_, data)
+      if data then
+        for _, line in ipairs(data) do
+          -- Strip carriage returns from PTY
+          line = line:gsub('\r', '')
+          table.insert(output, line)
+        end
+      end
+    end,
+    on_stderr = function(_, data)
+      if data then
+        for _, line in ipairs(data) do
+          table.insert(output, '[stderr] ' .. line)
+        end
+      end
+    end,
+    on_exit = function(_, exit_code)
+      vim.schedule(function()
+        -- Create a floating window for output
+        local buf = vim.api.nvim_create_buf(false, true)
+        table.insert(output, 1, '--- Mongosh Output (exit: ' .. exit_code .. ') ---')
+        table.insert(output, '')
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, output)
+        vim.api.nvim_set_option_value('filetype', 'javascript', { buf = buf })
+
+        local width = math.min(100, vim.o.columns - 10)
+        local height = math.min(#output + 1, vim.o.lines - 10)
+
+        vim.api.nvim_open_win(buf, true, {
+          relative = 'editor',
+          width = width,
+          height = height,
+          row = (vim.o.lines - height) / 2,
+          col = (vim.o.columns - width) / 2,
+          style = 'minimal',
+          border = 'rounded',
+          title = ' Mongosh ',
+          title_pos = 'center',
+        })
+      end)
+    end,
+  })
+end
+
+-- Normal mode: run current file
+vim.keymap.set('n', '<leader>me', function()
+  local file = vim.fn.expand '%:p'
+  run_mongosh(file, true)
+end, { desc = '[M]ongo [E]xecute current file' })
+
+-- Visual mode: run selected text
+vim.keymap.set('v', '<leader>me', function()
+  -- Get visual selection
+  vim.cmd 'normal! "vy'
+  local selection = vim.fn.getreg 'v'
+  run_mongosh(selection, false)
+end, { desc = '[M]ongo [E]xecute selection' })
+
