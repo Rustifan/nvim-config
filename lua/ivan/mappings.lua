@@ -154,12 +154,11 @@ local function run_mongosh(input, is_file)
 
   vim.fn.jobstart(cmd, {
     env = env,
-    pty = true,
+    stdout_buffered = true,
+    stderr_buffered = true,
     on_stdout = function(_, data)
       if data then
         for _, line in ipairs(data) do
-          -- Strip carriage returns from PTY
-          line = line:gsub('\r', '')
           table.insert(output, line)
         end
       end
@@ -184,7 +183,7 @@ local function run_mongosh(input, is_file)
         local width = math.min(100, vim.o.columns - 10)
         local height = math.min(#output + 1, vim.o.lines - 10)
 
-        vim.api.nvim_open_win(buf, true, {
+        local win = vim.api.nvim_open_win(buf, true, {
           relative = 'editor',
           width = width,
           height = height,
@@ -195,6 +194,8 @@ local function run_mongosh(input, is_file)
           title = ' Mongosh [' .. db.label .. '] ',
           title_pos = 'center',
         })
+
+        vim.api.nvim_set_option_value('wrap', false, { win = win })
       end)
     end,
   })
