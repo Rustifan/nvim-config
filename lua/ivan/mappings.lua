@@ -265,3 +265,63 @@ vim.keymap.set('n', '<leader>md', function()
   end)
 end, { desc = '[M]ongo [D]elete database' })
 
+-- Copy JSON path at cursor position
+local function mongo_copy_json_path()
+  local ts = vim.treesitter
+  local node = ts.get_node()
+  if not node then
+    vim.notify('No Treesitter node under cursor', vim.log.levels.WARN)
+    return
+  end
+
+  local path_parts = {}
+
+  while node do
+    local parent = node:parent()
+    if not parent then break end
+
+    local parent_type = parent:type()
+
+    if parent_type == 'pair' then
+      -- Get the key from the pair
+      local key_node = parent:field('key')[1]
+      if key_node then
+        local key = ts.get_node_text(key_node, 0)
+        -- Strip quotes if present
+        key = key:gsub('^["\']', ''):gsub('["\']$', '')
+        table.insert(path_parts, 1, key)
+      end
+    elseif parent_type == 'array' then
+      -- Only include array index if the array is a value inside a pair (object property)
+      local array_parent = parent:parent()
+      if array_parent and array_parent:type() == 'pair' then
+        -- Find index of current node in array
+        local index = 0
+        for child in parent:iter_children() do
+          if child:id() == node:id() then break end
+          -- Skip punctuation nodes
+          local child_type = child:type()
+          if child_type ~= ',' and child_type ~= '[' and child_type ~= ']' then
+            index = index + 1
+          end
+        end
+        table.insert(path_parts, 1, tostring(index))
+      end
+      -- If array is at root level (not inside a pair), skip the index
+    end
+
+    node = parent
+  end
+
+  if #path_parts == 0 then
+    vim.notify('Could not determine JSON path', vim.log.levels.WARN)
+    return
+  end
+
+  local path = table.concat(path_parts, '.')
+  vim.fn.setreg('+', path)
+  vim.notify('Copied: ' .. path)
+end
+
+vim.keymap.set('n', '<leader>my', mongo_copy_json_path, { desc = '[M]ongo [Y]ank JSON path' })
+
