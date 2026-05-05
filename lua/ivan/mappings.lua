@@ -53,6 +53,20 @@ vim.keymap.set('n', '<leader>rl', function()
   vim.notify('Copied path and line nunber: ' .. full_path)
 end, { desc = 'Copy [R]eference to a [L]ine number and path' })
 
+vim.keymap.set('n', '<leader>ap', function()
+  local path = vim.fn.expand '%:p'
+  vim.fn.setreg('+', path)
+  vim.notify('Copied absolute path: ' .. path)
+end, { desc = 'Copy [A]bsolute file [P]ath to clipboard' })
+
+vim.keymap.set('n', '<leader>al', function()
+  local line_number = vim.fn.line '.'
+  local path = vim.fn.expand '%:p'
+  local full_path = path .. ':' .. line_number
+  vim.fn.setreg('+', full_path)
+  vim.notify('Copied absolute path and line number: ' .. full_path)
+end, { desc = 'Copy [A]bsolute path and [L]ine number' })
+
 vim.api.nvim_create_user_command('DiffOrig', function()
   local orig_ft = vim.bo.filetype
   vim.cmd [[
