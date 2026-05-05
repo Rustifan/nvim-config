@@ -68,6 +68,9 @@ return {
 
       local mongo_tracked_buffers = {}
       local mongo_update_preview_buffers = {}
+      local mongo_transferred_windows = {}
+      local mongo_generate_update_preview
+      local mongo_track_result_window
 
       local function mongo_trim_lines(lines)
         local trimmed = vim.deepcopy(lines)
@@ -79,6 +82,34 @@ return {
 
       local function mongo_buffer_text(buf)
         return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+      end
+
+      local function mongo_set_window_options(win)
+        vim.api.nvim_set_option_value('wrap', false, { win = win })
+        vim.api.nvim_set_option_value('number', true, { win = win })
+        vim.api.nvim_set_option_value('relativenumber', true, { win = win })
+      end
+
+      local function mongo_open_buffer_in_tab(source_win)
+        local buf = vim.api.nvim_get_current_buf()
+        if vim.api.nvim_get_current_win() ~= source_win then
+          vim.cmd 'wincmd T'
+          return
+        end
+
+        mongo_transferred_windows[source_win] = true
+
+        vim.cmd 'tabnew'
+        vim.api.nvim_win_set_buf(0, buf)
+        local tab_win = vim.api.nvim_get_current_win()
+        mongo_set_window_options(tab_win)
+        if mongo_tracked_buffers[buf] then
+          mongo_track_result_window(buf, tab_win)
+        end
+
+        if vim.api.nvim_win_is_valid(source_win) then
+          vim.api.nvim_win_close(source_win, true)
+        end
       end
 
       local function mongo_open_float(lines, title, filetype, opts)
@@ -94,8 +125,8 @@ return {
         vim.api.nvim_set_option_value('modifiable', options.modifiable ~= false, { buf = buf })
         vim.api.nvim_set_option_value('filetype', filetype, { buf = buf })
 
-        local width = math.min(100, vim.o.columns - 10)
-        local height = math.min(#lines + 1, vim.o.lines - 10)
+        local width = math.min(120, vim.o.columns - 6)
+        local height = math.min(#lines + 3, vim.o.lines - 6)
         local win = vim.api.nvim_open_win(buf, true, {
           relative = 'editor',
           width = width,
@@ -108,7 +139,10 @@ return {
           title_pos = 'center',
         })
 
-        vim.api.nvim_set_option_value('wrap', false, { win = win })
+        mongo_set_window_options(win)
+        vim.keymap.set('n', '<C-w>T', function()
+          mongo_open_buffer_in_tab(win)
+        end, { buffer = buf, desc = 'Open Mongo window in tab' })
         return buf, win
       end
 
@@ -294,7 +328,7 @@ return {
         mongo_update_preview_buffers[buf] = true
       end
 
-      local function mongo_generate_update_preview(buf)
+      mongo_generate_update_preview = function(buf)
         local state = mongo_tracked_buffers[buf]
         if not state or state.processing or not vim.api.nvim_buf_is_valid(buf) then
           return
@@ -331,6 +365,26 @@ return {
         end)
       end
 
+      mongo_track_result_window = function(buf, win)
+        vim.api.nvim_create_autocmd('WinClosed', {
+          pattern = tostring(win),
+          once = true,
+          callback = function()
+            if mongo_transferred_windows[win] then
+              mongo_transferred_windows[win] = nil
+              return
+            end
+
+            mongo_generate_update_preview(buf)
+            vim.schedule(function()
+              if vim.api.nvim_buf_is_valid(buf) then
+                vim.api.nvim_buf_delete(buf, { force = true })
+              end
+            end)
+          end,
+        })
+      end
+
       local function mongo_track_result_buffer(buf, win, state)
         mongo_tracked_buffers[buf] = state
 
@@ -357,18 +411,7 @@ return {
           end,
         })
 
-        vim.api.nvim_create_autocmd('WinClosed', {
-          pattern = tostring(win),
-          once = true,
-          callback = function()
-            mongo_generate_update_preview(buf)
-            vim.schedule(function()
-              if vim.api.nvim_buf_is_valid(buf) then
-                vim.api.nvim_buf_delete(buf, { force = true })
-              end
-            end)
-          end,
-        })
+        mongo_track_result_window(buf, win)
       end
 
       local function run_mongosh(input, is_file, opts)
