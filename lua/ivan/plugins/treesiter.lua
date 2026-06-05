@@ -2,13 +2,15 @@ return {
   {
     'nvim-treesitter/nvim-treesitter',
     branch = 'main',
-    build = ':TSUpdate',
+    build = function()
+      pcall(vim.cmd, 'TSUpdate')
+    end,
     event = { 'BufReadPre', 'BufNewFile' },
     opts = {
       ensure_installed = {
         'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown',
         'markdown_inline', 'query', 'vim', 'vimdoc', 'php', 'javascript',
-        'typescript', 'xml', 'rust', 'go',
+        'typescript', 'tsx', 'css', 'json', 'yaml', 'xml', 'rust', 'go',
       },
       auto_install = true,
     },
@@ -16,11 +18,18 @@ return {
       require('nvim-treesitter').setup(opts)
 
       vim.api.nvim_create_autocmd('FileType', {
-        pattern = { 'go', 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'query', 'vim', 'vimdoc', 'php', 'javascript', 'typescript', 'xml', 'rust' },
+        pattern = {
+          'bash', 'c', 'css', 'diff', 'go', 'html', 'javascript', 'json',
+          'lua', 'luadoc', 'markdown', 'php', 'query', 'rust', 'typescript',
+          'xml', 'yaml', 'vim', 'vimdoc',
+        },
         callback = function()
           pcall(vim.treesitter.start)
         end,
       })
+
+      vim.treesitter.language.register('tsx', 'typescriptreact')
+      vim.treesitter.language.register('tsx', 'javascriptreact')
 
       vim.api.nvim_create_autocmd({ 'BufRead', 'BufNewFile' }, {
         pattern = '*.js',
