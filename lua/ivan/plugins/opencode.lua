@@ -8,6 +8,12 @@ return {
   },
   config = function()
     local opencode_cmd = 'opencode --port'
+    local snacks_terminal_opts = {
+      win = {
+        position = 'right',
+        width = math.floor(vim.o.columns * 0.35),
+      },
+    }
 
     local function tmux_opencode_pane()
       return vim.fn.system('tmux list-panes -F "#{pane_id} #{pane_current_command}" 2>/dev/null | grep -o "^%[0-9]* opencode" | head -1 | cut -d" " -f1'):gsub('\n', '')
@@ -24,10 +30,7 @@ return {
           if is_tmux() then
             vim.fn.system('tmux split-window -h "' .. opencode_cmd .. '"')
           else
-            require('opencode.terminal').open(opencode_cmd, {
-              split = 'right',
-              width = math.floor(vim.o.columns * 0.35),
-            })
+            require('snacks.terminal').open(opencode_cmd, snacks_terminal_opts)
           end
         end,
         stop = function()
@@ -37,7 +40,10 @@ return {
               vim.fn.system('tmux kill-pane -t ' .. pane)
             end
           else
-            require('opencode.terminal').close()
+            local terminal = require('snacks.terminal').get(opencode_cmd, vim.tbl_extend('force', snacks_terminal_opts, { create = false }))
+            if terminal then
+              terminal:close()
+            end
           end
         end,
         toggle = function()
@@ -49,10 +55,7 @@ return {
               vim.fn.system('tmux split-window -h "' .. opencode_cmd .. '"')
             end
           else
-            require('opencode.terminal').toggle(opencode_cmd, {
-              split = 'right',
-              width = math.floor(vim.o.columns * 0.35),
-            })
+            require('snacks.terminal').toggle(opencode_cmd, snacks_terminal_opts)
           end
         end,
       },
@@ -68,7 +71,7 @@ return {
       require('opencode').select()
     end, { desc = 'Execute opencode action…' })
     vim.keymap.set({ 'n', 't' }, '<leader>cc', function()
-      require('opencode').toggle()
+      vim.g.opencode_opts.server.toggle()
     end, { desc = 'Toggle opencode' })
 
     vim.keymap.set({ 'n', 'x' }, '<leader>cr', function()
