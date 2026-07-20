@@ -72,6 +72,7 @@ return {
       local mongo_result_queries = {} -- buf -> { db, code, raw }
       local mongo_generate_update_preview
       local mongo_track_result_window
+      local mongo_show_links
 
       local function mongo_trim_lines(lines)
         local trimmed = vim.deepcopy(lines)
@@ -496,10 +497,14 @@ return {
           end
 
           local function mongo_register_refresh(buf)
-            mongo_result_queries[buf] = { db = db, code = code, raw = options.raw }
+            local detected = tracked or mongo_detect_find_operation(code)
+            mongo_result_queries[buf] = { db = db, code = code, raw = options.raw, collection = detected and detected.collection }
             vim.keymap.set('n', '<leader>mr', function()
               mongo_refresh_result(buf)
             end, { buffer = buf, desc = '[M]ongo [R]efresh result' })
+            vim.keymap.set('n', '<leader>ml', function()
+              mongo_show_links(buf)
+            end, { buffer = buf, desc = '[M]ongo [L]inks for document' })
             vim.api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout' }, {
               buffer = buf,
               once = true,
@@ -770,6 +775,100 @@ return {
 
       vim.keymap.set('n', '<leader>my', mongo_copy_json_path, { desc = '[M]ongo [Y]ank JSON path' })
       vim.keymap.set('n', '<leader>mY', mongo_copy_json_path_with_value, { desc = '[M]ongo [Y]ank JSON path with value' })
+
+      local mongo_links_file = vim.fn.stdpath('data') .. '/mongo_links.json'
+
+      local mongo_links_seed_lines = {
+        '{',
+        '  "KompareOffer": [',
+        '    {',
+        '      "db": "local/kompare-platform",',
+        '      "links": [',
+        '        { "label": "New KPAS", "path": "http://kp.loc:3003/kompare-offer/<id>" },',
+        '        { "label": "Old KPAS", "path": "http://kp.loc/administracija/kpas/osiguranje-auto-ponude/<id>/" }',
+        '      ]',
+        '    }',
+        '  ]',
+        '}',
+      }
+
+      local function mongo_links_seed()
+        if vim.fn.filereadable(mongo_links_file) == 1 then return end
+        vim.fn.writefile(mongo_links_seed_lines, mongo_links_file)
+      end
+
+      local function mongo_links_load()
+        mongo_links_seed()
+        local content = table.concat(vim.fn.readfile(mongo_links_file), '\n')
+        return mongo_decoded_json_value(content) or {}
+      end
+
+      local function mongo_document_node_at_cursor()
+        local node = vim.treesitter.get_node()
+        while node do
+          local parent = node:parent()
+          local parent_type = parent and parent:type()
+          local grandparent = parent and parent:parent()
+          local root_object = node:type() == 'object' and parent_type == 'document'
+          local root_array_object = node:type() == 'object'
+            and parent_type == 'array'
+            and grandparent
+            and grandparent:type() == 'document'
+          if root_object or root_array_object then return node end
+          node = parent
+        end
+        return nil
+      end
+
+      local function mongo_document_id_at_cursor()
+        local doc_node = mongo_document_node_at_cursor()
+        if not doc_node then return nil end
+
+        local doc = mongo_decoded_json_value(vim.treesitter.get_node_text(doc_node, 0))
+        if type(doc) ~= 'table' then return nil end
+        return mongo_object_id_value(doc._id)
+      end
+
+      local function mongo_links_for(collection, db_label)
+        local entries = mongo_links_load()[collection] or {}
+        for _, entry in ipairs(entries) do
+          if entry.db == db_label then return entry.links or {} end
+        end
+        return {}
+      end
+
+      mongo_show_links = function(buf)
+        local q = mongo_result_queries[buf]
+        if not q or not q.collection then
+          vim.notify('No collection tracked for this Mongo result', vim.log.levels.WARN)
+          return
+        end
+
+        local id = mongo_document_id_at_cursor()
+        if not id then
+          vim.notify('Could not find document _id under cursor', vim.log.levels.WARN)
+          return
+        end
+
+        local links = mongo_links_for(q.collection, q.db.label)
+        if #links == 0 then
+          vim.notify('No links configured for ' .. q.collection .. ' @ ' .. q.db.label .. ' — <leader>mL to edit', vim.log.levels.WARN)
+          return
+        end
+
+        local lines = {}
+        for _, link in ipairs(links) do
+          if #lines > 0 then table.insert(lines, '') end
+          table.insert(lines, '# ' .. link.label)
+          table.insert(lines, (link.path:gsub('<id>', id)))
+        end
+        mongo_open_float(lines, ' Mongo links [' .. q.collection .. '] ', 'markdown')
+      end
+
+      vim.keymap.set('n', '<leader>mL', function()
+        mongo_links_seed()
+        vim.cmd.edit(mongo_links_file)
+      end, { desc = '[M]ongo edit [L]inks config' })
     end,
   },
 }
