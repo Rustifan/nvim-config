@@ -69,6 +69,7 @@ return {
       local mongo_tracked_buffers = {}
       local mongo_update_preview_buffers = {}
       local mongo_transferred_windows = {}
+      local mongo_result_queries = {} -- buf -> { db, code, raw }
       local mongo_generate_update_preview
       local mongo_track_result_window
 
@@ -414,6 +415,54 @@ return {
         mongo_track_result_window(buf, win)
       end
 
+      local function mongo_refresh_render(buf, win, lines)
+        local cursor = vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_cursor(win) or nil
+        vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        vim.api.nvim_set_option_value('modified', false, { buf = buf })
+
+        if win >= 0 and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative ~= '' then
+          vim.api.nvim_win_set_height(win, math.min(#lines + 3, vim.o.lines - 6))
+        end
+
+        if cursor and win >= 0 and vim.api.nvim_win_is_valid(win) then
+          local last = vim.api.nvim_buf_line_count(buf)
+          vim.api.nvim_win_set_cursor(win, { math.min(cursor[1], last), cursor[2] })
+        end
+      end
+
+      local function mongo_refresh_result(buf)
+        local q = mongo_result_queries[buf]
+        if not q then
+          vim.notify('Not a refreshable Mongo result window', vim.log.levels.WARN)
+          return
+        end
+
+        local wrapped = mongo_wrap_query(q.code, q.raw)
+        mongo_run_job(q.db, wrapped, function(exit_code, output)
+          if exit_code ~= 0 then
+            vim.notify('Mongo refresh failed (exit ' .. exit_code .. ')', vim.log.levels.ERROR)
+            return
+          end
+          if #output == 0 then
+            vim.notify('Mongo refresh returned no output', vim.log.levels.WARN)
+            return
+          end
+          if not vim.api.nvim_buf_is_valid(buf) then
+            return
+          end
+
+          local win = (vim.fn.win_findbuf(buf))[1] or -1
+          mongo_refresh_render(buf, win, output)
+
+          local state = mongo_tracked_buffers[buf]
+          if state then
+            state.original_text = table.concat(output, '\n')
+          end
+          vim.notify('Mongo result refreshed')
+        end)
+      end
+
       local function run_mongosh(input, is_file, opts)
         local options = opts or {}
         local db = mongo_get_current()
@@ -446,9 +495,24 @@ return {
             return
           end
 
+          local function mongo_register_refresh(buf)
+            mongo_result_queries[buf] = { db = db, code = code, raw = options.raw }
+            vim.keymap.set('n', '<leader>mr', function()
+              mongo_refresh_result(buf)
+            end, { buffer = buf, desc = '[M]ongo [R]efresh result' })
+            vim.api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout' }, {
+              buffer = buf,
+              once = true,
+              callback = function()
+                mongo_result_queries[buf] = nil
+              end,
+            })
+          end
+
           local output_text = table.concat(output, '\n')
           if not mongo_has_object_id(output_text) then
-            mongo_open_float(output, ' Mongo result [' .. db.label .. '] ', 'json')
+            local plain_buf = mongo_open_float(output, ' Mongo result [' .. db.label .. '] ', 'json')
+            mongo_register_refresh(plain_buf)
             return
           end
 
@@ -457,6 +521,7 @@ return {
             buftype = 'acwrite',
             name = 'mongo-result://' .. tracked.collection .. '/' .. tostring(vim.loop.hrtime()),
           })
+          mongo_register_refresh(buf)
           mongo_track_result_buffer(buf, win, {
             db = db,
             collection = tracked.collection,
@@ -541,8 +606,78 @@ return {
         end)
       end, { desc = '[M]ongo [D]elete database' })
 
-      -- Copy JSON path at cursor position
-      local function mongo_copy_json_path()
+      local function mongo_quote_json_string(text)
+        return vim.fn.json_encode(text)
+      end
+
+      local function mongo_pair_value_node(pair)
+        return pair:field('value')[1]
+      end
+
+      local function mongo_pair_key(pair)
+        local key_node = pair:field('key')[1]
+        if not key_node then return nil end
+
+        return vim.treesitter.get_node_text(key_node, 0):gsub('^["\']', ''):gsub('["\']$', '')
+      end
+
+      local function mongo_decoded_json_value(text)
+        local ok, value = pcall(vim.fn.json_decode, text)
+        if not ok then return nil end
+        return value
+      end
+
+      local function mongo_table_key_count(value)
+        return vim.tbl_count(value)
+      end
+
+      local function mongo_object_id_value(value)
+        if type(value) ~= 'table' then return nil end
+        if mongo_table_key_count(value) ~= 1 then return nil end
+        if type(value['$oid']) ~= 'string' then return nil end
+        return value['$oid']
+      end
+
+      local function mongo_is_object_id_value(value)
+        return mongo_object_id_value(value) ~= nil
+      end
+
+      local function mongo_is_object_id_node(node)
+        return mongo_is_object_id_value(mongo_decoded_json_value(vim.treesitter.get_node_text(node, 0)))
+      end
+
+      local function mongo_is_dbref_value(value)
+        if type(value) ~= 'table' then return false end
+        if type(value['$ref']) ~= 'string' then return false end
+        return value['$id'] ~= nil
+      end
+
+      local function mongo_is_dbref_node(node)
+        return mongo_is_dbref_value(mongo_decoded_json_value(vim.treesitter.get_node_text(node, 0)))
+      end
+
+      local function mongo_is_dbref_object_id_node(node)
+        if not mongo_is_object_id_node(node) then return false end
+
+        local parent_pair = node:parent()
+        if not parent_pair or parent_pair:type() ~= 'pair' then return false end
+        if mongo_pair_key(parent_pair) ~= '$id' then return false end
+
+        local dbref_node = parent_pair:parent()
+        return dbref_node and dbref_node:type() == 'object' and mongo_is_dbref_node(dbref_node)
+      end
+
+      local function mongo_format_json_value(text, opts)
+        local options = opts or {}
+        if options.inside_dbref then return text end
+
+        local object_id = mongo_object_id_value(mongo_decoded_json_value(text))
+        if object_id then return 'ObjectId(' .. mongo_quote_json_string(object_id) .. ')' end
+        return text
+      end
+
+      -- Get JSON path and value at cursor position
+      local function mongo_json_path_info()
         local ts = vim.treesitter
         local node = ts.get_node()
         if not node then
@@ -551,6 +686,8 @@ return {
         end
 
         local path_parts = {}
+        local value_node
+        local inside_dbref = false
 
         while node do
           local parent = node:parent()
@@ -560,13 +697,16 @@ return {
 
           if parent_type == 'pair' then
             -- Get the key from the pair
-            local key_node = parent:field('key')[1]
-            if key_node then
-              local key = ts.get_node_text(key_node, 0)
-              -- Strip quotes if present
-              key = key:gsub('^["\']', ''):gsub('["\']$', '')
-              table.insert(path_parts, 1, key)
-            end
+            local object_node = parent:parent()
+            local pair_is_object_id = object_node
+              and object_node:type() == 'object'
+              and mongo_is_object_id_node(object_node)
+              and not mongo_is_dbref_object_id_node(object_node)
+            local key = mongo_pair_key(parent)
+            if key and not pair_is_object_id then table.insert(path_parts, 1, key) end
+            value_node = value_node or (pair_is_object_id and object_node or mongo_pair_value_node(parent))
+            inside_dbref = inside_dbref
+              or (object_node and object_node:type() == 'object' and mongo_is_dbref_node(object_node))
           elseif parent_type == 'array' then
             -- Only include array index if the array is a value inside a pair (object property)
             local array_parent = parent:parent()
@@ -583,6 +723,7 @@ return {
               end
               table.insert(path_parts, 1, tostring(index))
             end
+            value_node = value_node or node
             -- If array is at root level (not inside a pair), skip the index
           end
 
@@ -594,12 +735,41 @@ return {
           return
         end
 
-        local path = table.concat(path_parts, '.')
+        return {
+          path = table.concat(path_parts, '.'),
+          value = value_node and ts.get_node_text(value_node, 0) or nil,
+          inside_dbref = inside_dbref,
+        }
+      end
+
+      -- Copy JSON path at cursor position
+      local function mongo_copy_json_path()
+        local info = mongo_json_path_info()
+        if not info then return end
+
+        local path = mongo_quote_json_string(info.path)
         vim.fn.setreg('+', path)
         vim.notify('Copied: ' .. path)
       end
 
+      local function mongo_copy_json_path_with_value()
+        local info = mongo_json_path_info()
+        if not info then return end
+
+        if not info.value then
+          vim.notify('Could not determine JSON value', vim.log.levels.WARN)
+          return
+        end
+
+        local text = mongo_quote_json_string(info.path) .. ': ' .. mongo_format_json_value(info.value, {
+          inside_dbref = info.inside_dbref,
+        })
+        vim.fn.setreg('+', text)
+        vim.notify('Copied: ' .. text)
+      end
+
       vim.keymap.set('n', '<leader>my', mongo_copy_json_path, { desc = '[M]ongo [Y]ank JSON path' })
+      vim.keymap.set('n', '<leader>mY', mongo_copy_json_path_with_value, { desc = '[M]ongo [Y]ank JSON path with value' })
     end,
   },
 }
