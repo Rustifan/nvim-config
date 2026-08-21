@@ -24,13 +24,6 @@ vim.keymap.set('n', '<C-l>', '<C-w><C-l>', { desc = 'Move focus to the right win
 vim.keymap.set('n', '<C-j>', '<C-w><C-j>', { desc = 'Move focus to the lower window' })
 vim.keymap.set('n', '<C-k>', '<C-w><C-k>', { desc = 'Move focus to the upper window' })
 
--- CopilotChat.nvim keymaps
-vim.keymap.set('n', '<leader>cc', '<cmd>CopilotChatToggle<CR>', { desc = 'CopilotChat: Toggle chat window' })
-vim.keymap.set('n', '<leader>cq', '<cmd>CopilotChatQuit<CR>', { desc = 'CopilotChat: Quit chat' })
-vim.keymap.set('n', '<leader>cr', '<cmd>CopilotChatReset<CR>', { desc = 'CopilotChat: Reset chat' })
-vim.keymap.set('v', '<leader>ce', ':CopilotChatExplain<CR>', { desc = 'CopilotChat: Explain selection' })
-vim.keymap.set('v', '<leader>cf', ':CopilotChatFix<CR>', { desc = 'CopilotChat: Fix selection' })
-
 vim.api.nvim_create_autocmd('TextYankPost', {
   desc = 'Highlight when yanking (copying) text',
   group = vim.api.nvim_create_augroup('kickstart-highlight-yank', { clear = true }),
@@ -53,6 +46,20 @@ vim.keymap.set('n', '<leader>rl', function()
   vim.notify('Copied path and line nunber: ' .. full_path)
 end, { desc = 'Copy [R]eference to a [L]ine number and path' })
 
+vim.keymap.set('n', '<leader>ap', function()
+  local path = vim.fn.expand '%:p'
+  vim.fn.setreg('+', path)
+  vim.notify('Copied absolute path: ' .. path)
+end, { desc = 'Copy [A]bsolute file [P]ath to clipboard' })
+
+vim.keymap.set('n', '<leader>al', function()
+  local line_number = vim.fn.line '.'
+  local path = vim.fn.expand '%:p'
+  local full_path = path .. ':' .. line_number
+  vim.fn.setreg('+', full_path)
+  vim.notify('Copied absolute path and line number: ' .. full_path)
+end, { desc = 'Copy [A]bsolute path and [L]ine number' })
+
 vim.api.nvim_create_user_command('DiffOrig', function()
   local orig_ft = vim.bo.filetype
   vim.cmd [[
@@ -66,4 +73,3 @@ end, {})
 vim.api.nvim_create_user_command('Ex', function(opts)
   vim.cmd('Oil ' .. opts.args)
 end, { nargs = '*' })
-
