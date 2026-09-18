@@ -148,6 +148,11 @@ return {
         end
       end
 
+      -- the confirm float has to sit above the result/preview floats it is spawned over, yet below
+      -- the vim.ui.select picker that asks for the final yes (telescope-ui-select renders at 50)
+      local mongo_float_zindex = 40
+      local mongo_confirm_zindex = 45
+
       local function mongo_open_float(lines, title, filetype, opts)
         local options = opts or {}
         local buf = vim.api.nvim_create_buf(false, true)
@@ -173,6 +178,7 @@ return {
           border = 'rounded',
           title = title,
           title_pos = 'center',
+          zindex = options.zindex or mongo_float_zindex,
         })
 
         mongo_set_window_options(win)
@@ -207,6 +213,7 @@ return {
 
       local mongo_section_marker = '@@MONGO_SECTION@@'
       local mongo_section_end_marker = '@@MONGO_SECTION_END@@'
+      local mongo_max_eval_length = 100000
 
       local function mongo_char_set(text)
         local set = {}
@@ -505,13 +512,26 @@ return {
         return ok
       end
 
+      local function mongo_script_file(code)
+        local path = vim.fn.tempname() .. '.js'
+        vim.fn.writefile(vim.split(code, '\n'), path)
+        return path
+      end
+
+      local function mongo_command(db, flag, script)
+        return { 'mongosh', db.url, '--norc', '--quiet', flag, script }
+      end
+
       local function mongo_start_job(db, code, on_exit)
-        local cmd = { 'mongosh', db.url, '--norc', '--quiet', '--eval', code }
+        -- --eval passes the script as a single argv entry, which dies with E2BIG once a document is
+        -- embedded in it, so anything past one argument's worth of code runs from a file instead
+        local script_file = #code > mongo_max_eval_length and mongo_script_file(code) or nil
+        local cmd = script_file and mongo_command(db, '--file', script_file) or mongo_command(db, '--eval', code)
         local env = { NO_COLOR = '1' }
         local output = {}
         local errors = {}
 
-        local job = vim.fn.jobstart(cmd, {
+        local started, job = pcall(vim.fn.jobstart, cmd, {
           env = env,
           stdout_buffered = true,
           stderr_buffered = true,
@@ -531,13 +551,15 @@ return {
           end,
           on_exit = function(_, exit_code)
             vim.schedule(function()
+              if script_file then os.remove(script_file) end
               on_exit(exit_code, mongo_trim_lines(output), mongo_trim_lines(errors))
             end)
           end,
         })
 
-        if job <= 0 then
-          vim.notify('Failed to start mongosh', vim.log.levels.ERROR)
+        if not started or job <= 0 then
+          if script_file then os.remove(script_file) end
+          vim.notify('Failed to start mongosh' .. (started and '' or ': ' .. tostring(job)), vim.log.levels.ERROR)
         end
       end
 
@@ -558,7 +580,10 @@ return {
       end
 
       local function mongo_confirm_run(db, code, on_confirm)
-        local _, win = mongo_open_float(mongo_confirm_lines(db, code), ' PROTECTED DB [' .. db.label .. '] ', 'javascript', { modifiable = false })
+        local _, win = mongo_open_float(mongo_confirm_lines(db, code), ' PROTECTED DB [' .. db.label .. '] ', 'javascript', {
+          modifiable = false,
+          zindex = mongo_confirm_zindex,
+        })
 
         vim.cmd 'redraw'
         vim.ui.input({ prompt = 'Type the database name (' .. db.label .. ') to allow: ' }, function(answer)
@@ -712,7 +737,9 @@ return {
         end
 
         local script = mongo_ejson_preview_script(state.collection, edited_text)
-        mongo_run_job(state.db, script, function(exit_code, output, errors)
+        -- skips the protected-db gate on purpose: this script only findOnes the live docs to diff
+        -- them, and the updateOne it prints stays gated until you run the preview
+        mongo_start_job(state.db, script, function(exit_code, output, errors)
           local output_text = table.concat(output, '\n')
           if exit_code ~= 0 then
             vim.notify('Could not build Mongo update preview', vim.log.levels.ERROR)
