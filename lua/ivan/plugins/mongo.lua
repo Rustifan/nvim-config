@@ -590,12 +590,12 @@ return {
         return { 'mongosh', mongo_active_url(db), '--norc', '--quiet', flag, script }
       end
 
-      local function mongo_start_job(db, code, on_exit)
+      local function mongo_start_job(db, code, on_exit, extra_env)
         -- --eval passes the script as a single argv entry, which dies with E2BIG once a document is
         -- embedded in it, so anything past one argument's worth of code runs from a file instead
         local script_file = #code > mongo_max_eval_length and mongo_script_file(code) or nil
         local cmd = script_file and mongo_command(db, '--file', script_file) or mongo_command(db, '--eval', code)
-        local env = { NO_COLOR = '1' }
+        local env = vim.tbl_extend('force', { NO_COLOR = '1' }, extra_env or {})
         local output = {}
         local errors = {}
 
@@ -1152,6 +1152,378 @@ return {
         end, code)
       end
 
+
+      -- Collection copy: mongosh always connects to the target, the source is only ever read
+      local mongo_copy_marker = '__MONGO_COPY__'
+
+      local mongo_copy_modes = {
+        { key = 'replace', label = 'Replace — drop the target collection, then copy' },
+        { key = 'merge', label = 'Merge — upsert by _id, keep target-only documents' },
+        { key = 'create', label = 'Create — abort if the target collection exists' },
+      }
+
+      -- the mongosh cli accepts a scheme-less connection string, but connect() inside a script folds
+      -- the query string into the database name unless the uri is absolute
+      local function mongo_copy_source_uri(db)
+        local url = mongo_active_url(db)
+        local absolute = mongo_split_url(url).scheme ~= '' and url or 'mongodb://' .. url
+        if absolute:match 'readPreference=' then return absolute end
+        return absolute .. (absolute:find('?', 1, true) and '&' or '?') .. 'readPreference=secondaryPreferred'
+      end
+
+      local function mongo_copy_script_header(spec)
+        return [[
+      const __source = connect(process.env.MONGO_COPY_SOURCE_URI).getCollection(]] .. vim.fn.json_encode(spec.source_collection) .. [[);
+      const __targetName = ]] .. vim.fn.json_encode(spec.target_collection) .. [[;
+      ]]
+      end
+
+      local function mongo_copy_preflight_script(spec)
+        return mongo_copy_script_header(spec) .. [[
+      const __infos = db.getCollectionInfos({ name: __targetName });
+      const __exists = __infos.length > 0;
+
+      print(']] .. mongo_copy_marker .. [[' + EJSON.stringify({
+        sourceCount: __source.estimatedDocumentCount(),
+        sourceIndexes: __source.getIndexes().filter(index => index.name !== '_id_').length,
+        targetExists: __exists,
+        targetType: __exists ? __infos[0].type : '',
+        targetCount: __exists ? db.getCollection(__targetName).estimatedDocumentCount() : 0,
+      }));
+      ]]
+      end
+
+      local function mongo_copy_script(spec)
+        return mongo_copy_script_header(spec) .. [[
+      const __mode = ]] .. vim.fn.json_encode(spec.mode.key) .. [[;
+      const __batchSize = 500;
+      const __existing = db.getCollectionInfos({ name: __targetName });
+
+      if (__mode === 'create' && __existing.length > 0) {
+        throw new Error(`Target collection ${__targetName} already exists`);
+      }
+      if (__mode === 'replace' && __existing.length > 0) {
+        db.getCollection(__targetName).drop();
+      }
+
+      const __target = db.getCollection(__targetName);
+      const __total = __source.countDocuments({});
+      const __cursor = __source.find({});
+      const __operation = doc => __mode === 'merge'
+        ? { replaceOne: { filter: { _id: doc._id }, replacement: doc, upsert: true } }
+        : { insertOne: { document: doc } };
+
+      // mongosh awaits driver calls inside Array.prototype callbacks but not inside an Array.from
+      // mapper, where hasNext() reads as false, so the slots are allocated first and drained with map
+      const __batchSlots = Array.from({ length: __batchSize });
+      const __takeBatch = () => __batchSlots
+        .map(() => __cursor.hasNext() ? __cursor.next() : null)
+        .filter(doc => doc !== null);
+
+      const __passes = Array.from({ length: Math.ceil(__total / __batchSize) + 1 });
+      const __written = __passes.reduce(totals => {
+        const docs = __takeBatch();
+        if (docs.length === 0) return totals;
+
+        const result = __target.bulkWrite(docs.map(__operation), { ordered: false });
+        return {
+          copied: totals.copied + docs.length,
+          inserted: totals.inserted + result.insertedCount + result.upsertedCount,
+          replaced: totals.replaced + result.modifiedCount,
+        };
+      }, { copied: 0, inserted: 0, replaced: 0 });
+
+      const __indexes = __source.getIndexes().filter(index => index.name !== '_id_');
+      const __indexErrors = __indexes.flatMap(index => {
+        const { key, v, ns, background, ...options } = index;
+        try {
+          __target.createIndex(key, options);
+          return [];
+        } catch (error) {
+          return [`${index.name}: ${error.message}`];
+        }
+      });
+
+      print(']] .. mongo_copy_marker .. [[' + EJSON.stringify({
+        copied: __written.copied,
+        inserted: __written.inserted,
+        replaced: __written.replaced,
+        indexes: __indexes.length - __indexErrors.length,
+        indexErrors: __indexErrors,
+        targetCount: __target.countDocuments({}),
+      }));
+      ]]
+      end
+
+      local function mongo_copy_payload(output)
+        for _, line in ipairs(output) do
+          if line:sub(1, #mongo_copy_marker) == mongo_copy_marker then
+            return line:sub(#mongo_copy_marker + 1)
+          end
+        end
+        return nil
+      end
+
+      local function mongo_copy_decode(output)
+        local payload = mongo_copy_payload(output)
+        if not payload then return nil end
+
+        local ok, decoded = pcall(vim.fn.json_decode, payload)
+        if not ok or type(decoded) ~= 'table' then return nil end
+        return decoded
+      end
+
+      local function mongo_copy_target_entry(target, database)
+        return vim.tbl_extend('force', vim.deepcopy(target), { database = database })
+      end
+
+      local function mongo_copy_endpoint(db, collection)
+        return db.label .. '  › ' .. (mongo_active_db(db) or '(no db)') .. '  › ' .. collection
+      end
+
+      local function mongo_copy_from_line(spec)
+        return 'FROM   ' .. mongo_copy_endpoint(spec.source, spec.source_collection)
+      end
+
+      local function mongo_copy_to_line(spec)
+        return 'TO     ' .. mongo_copy_endpoint(spec.target, spec.target_collection)
+      end
+
+      -- the source connection string carries credentials, so it travels in the environment instead
+      -- of the script file mongosh reads for anything past mongo_max_eval_length
+      local function mongo_copy_job(spec, script, on_result)
+        mongo_start_job(spec.target, script, function(exit_code, output, errors)
+          local decoded = exit_code == 0 and mongo_copy_decode(output) or nil
+          if not decoded then
+            mongo_open_output_float(spec.target, exit_code, output, errors)
+            return
+          end
+          on_result(decoded)
+        end, { MONGO_COPY_SOURCE_URI = mongo_copy_source_uri(spec.source) })
+      end
+
+      local function mongo_copy_warning_lines(spec, stats)
+        if not stats.targetExists or stats.targetCount == 0 then
+          return { '', 'Target is empty — nothing will be overwritten.' }
+        end
+        if spec.mode.key == 'replace' then
+          return {
+            '',
+            string.format('WARNING  the target already holds %s documents.', stats.targetCount),
+            'They will be DROPPED, together with their indexes, before the copy.',
+          }
+        end
+        return {
+          '',
+          string.format('WARNING  the target already holds %s documents.', stats.targetCount),
+          'Documents sharing an _id with the source will be overwritten.',
+        }
+      end
+
+      local function mongo_copy_plan_lines(spec, stats)
+        local plan = {
+          mongo_copy_from_line(spec),
+          string.format('       %s documents · %s indexes · read only', stats.sourceCount, stats.sourceIndexes),
+          '',
+          mongo_copy_to_line(spec),
+          '',
+          'MODE   ' .. spec.mode.label,
+        }
+        return vim.list_extend(plan, mongo_copy_warning_lines(spec, stats))
+      end
+
+      local function mongo_copy_result_lines(spec, result)
+        local lines = {
+          mongo_copy_from_line(spec),
+          mongo_copy_to_line(spec),
+          '',
+          string.format('copied %s documents (%s inserted · %s replaced)', result.copied, result.inserted, result.replaced),
+          string.format('target now holds %s documents', result.targetCount),
+          string.format('indexes recreated: %s', result.indexes),
+        }
+        if #(result.indexErrors or {}) == 0 then return lines end
+
+        return vim.list_extend(vim.list_extend(lines, { '', 'index errors:' }), result.indexErrors)
+      end
+
+      local function mongo_copy_open_result(spec, result)
+        local buf, win = mongo_open_float(mongo_copy_result_lines(spec, result), ' Mongo copy done ', 'text', {
+          modifiable = false,
+          footer = ' q close ',
+        })
+        mongo_close_keymaps(buf, win, 'Close Mongo copy result')
+      end
+
+      local function mongo_copy_run(spec)
+        vim.notify('Copying ' .. spec.source_collection .. ' → ' .. mongo_copy_endpoint(spec.target, spec.target_collection))
+        mongo_copy_job(spec, mongo_copy_script(spec), function(result)
+          mongo_copy_open_result(spec, result)
+        end)
+      end
+
+      local function mongo_copy_confirm(spec, stats)
+        local overwrites = stats.targetExists and stats.targetCount > 0
+        local title = overwrites and ' MONGO COPY — WILL OVERWRITE ' or ' Mongo copy '
+        local buf, win = mongo_open_float(mongo_copy_plan_lines(spec, stats), title, 'text', {
+          modifiable = false,
+          zindex = mongo_confirm_zindex,
+          footer = overwrites and ' <CR> confirm (asks for the target label) · q cancel ' or ' <CR> run copy · q cancel ',
+        })
+
+        local function cancel()
+          mongo_close_window(win)
+          vim.notify('Mongo copy cancelled', vim.log.levels.WARN)
+        end
+
+        vim.keymap.set('n', 'q', cancel, { buffer = buf, desc = 'Cancel Mongo copy' })
+        vim.keymap.set('n', '<Esc>', cancel, { buffer = buf, desc = 'Cancel Mongo copy' })
+        vim.keymap.set('n', '<CR>', function()
+          if overwrites then
+            mongo_ask_database_name(spec.target, win, function()
+              mongo_copy_run(spec)
+            end)
+            return
+          end
+
+          mongo_close_window(win)
+          mongo_copy_run(spec)
+        end, { buffer = buf, desc = 'Confirm Mongo copy' })
+      end
+
+      local function mongo_copy_preflight(spec)
+        mongo_copy_job(spec, mongo_copy_preflight_script(spec), function(stats)
+          if stats.targetType == 'view' then
+            vim.notify('Target ' .. spec.target_collection .. ' is a view, not a collection', vim.log.levels.ERROR)
+            return
+          end
+          if stats.targetExists and spec.mode.key == 'create' then
+            vim.notify('Target collection already exists — pick Replace or Merge', vim.log.levels.WARN)
+            return
+          end
+          mongo_copy_confirm(spec, stats)
+        end)
+      end
+
+      local function mongo_copy_same_namespace(spec)
+        return mongo_active_url(spec.source) == mongo_active_url(spec.target)
+          and spec.source_collection == spec.target_collection
+      end
+
+      local function mongo_copy_choose_mode(spec)
+        vim.ui.select(mongo_copy_modes, {
+          prompt = 'Copy into ' .. mongo_copy_endpoint(spec.target, spec.target_collection) .. ':',
+          format_item = function(mode)
+            return mode.label
+          end,
+        }, function(mode)
+          if not mode then return end
+          mongo_copy_preflight(vim.tbl_extend('force', spec, { mode = mode }))
+        end)
+      end
+
+      local function mongo_copy_choose_target_collection(spec)
+        vim.ui.input({
+          prompt = 'Target collection on ' .. mongo_db_display(spec.target) .. ': ',
+          default = spec.source_collection,
+        }, function(name)
+          if not name or vim.trim(name) == '' then return end
+
+          local filled = vim.tbl_extend('force', spec, { target_collection = vim.trim(name) })
+          if mongo_copy_same_namespace(filled) then
+            vim.notify('Source and target are the same collection', vim.log.levels.ERROR)
+            return
+          end
+          mongo_copy_choose_mode(filled)
+        end)
+      end
+
+      local mongo_copy_new_database = '+ new database…'
+
+      local function mongo_copy_ordered_databases(target, names)
+        local active = mongo_active_db(target)
+        if not active or not vim.tbl_contains(names, active) then return names end
+
+        local rest = vim.tbl_filter(function(name)
+          return name ~= active
+        end, names)
+        return vim.list_extend({ active }, rest)
+      end
+
+      local function mongo_copy_database_items(target, names)
+        local ordered = mongo_copy_ordered_databases(target, names)
+        return vim.list_extend(vim.deepcopy(ordered), { mongo_copy_new_database })
+      end
+
+      local function mongo_copy_choose_target_database(spec)
+        local function continue(name)
+          if not name or vim.trim(name) == '' then return end
+          mongo_copy_choose_target_collection(vim.tbl_extend('force', spec, {
+            target = mongo_copy_target_entry(spec.target, vim.trim(name)),
+          }))
+        end
+
+        local function ask_new_database()
+          vim.ui.input({ prompt = 'New database on ' .. spec.target.label .. ': ' }, continue)
+        end
+
+        mongo_start_job(spec.target, mongo_list_databases_script, function(exit_code, output)
+          local names = mongo_parse_names(exit_code, output)
+          if not names then
+            ask_new_database()
+            return
+          end
+
+          vim.ui.select(mongo_copy_database_items(spec.target, names), {
+            prompt = 'Copy into which database on ' .. spec.target.label .. ':',
+          }, function(name)
+            if name == mongo_copy_new_database then return ask_new_database() end
+            continue(name)
+          end)
+        end)
+      end
+
+      local function mongo_copy_choose_target(spec)
+        vim.ui.select(mongo_database_items(true), {
+          prompt = 'Copy ' .. spec.source_collection .. ' into which connection:',
+        }, function(_, idx)
+          if not idx then return end
+
+          local target = mongo_databases[idx]
+          if mongo_is_protected(target) then
+            vim.notify('Refusing to copy into a protected database: ' .. target.label, vim.log.levels.ERROR)
+            return
+          end
+          mongo_copy_choose_target_database(vim.tbl_extend('force', spec, { target = target }))
+        end)
+      end
+
+      local function mongo_copy_choose_source_collection(source)
+        mongo_start_job(source, mongo_list_collections_script, function(exit_code, output, errors)
+          local names = mongo_parse_names(exit_code, output)
+          if not names then
+            vim.notify('Could not list collections on ' .. source.label .. ': ' .. (errors[1] or output[1] or 'no output'), vim.log.levels.WARN)
+            return
+          end
+
+          vim.ui.select(names, { prompt = 'Copy which collection from ' .. mongo_db_display(source) .. ':' }, function(name)
+            if not name then return end
+            mongo_copy_choose_target({ source = source, source_collection = name })
+          end)
+        end)
+      end
+
+      -- Copy a collection into another database on this or any other connection
+      vim.keymap.set('n', '<leader>mC', function()
+        mongo_with_current_db(function(source)
+          if not mongo_active_db(source) then
+            mongo_pick_db(source, function()
+              mongo_copy_choose_source_collection(source)
+            end)
+            return
+          end
+          mongo_copy_choose_source_collection(source)
+        end)
+      end, { desc = '[M]ongo [C]opy collection to another database' })
       -- Normal mode: run current file
       vim.keymap.set('n', '<leader>me', function()
         local buf = vim.api.nvim_get_current_buf()
