@@ -41,27 +41,61 @@ return {
         return mongo_databases[mongo_current_db]
       end
 
-      local function mongo_add_database(label, url)
-        table.insert(mongo_databases, { label = label, url = url })
+      local function mongo_is_protected(db)
+        return db ~= nil and db.protected == true
+      end
+
+      local function mongo_db_display(db)
+        if not mongo_is_protected(db) then return db.label end
+        return db.label .. '  [PROTECTED]'
+      end
+
+      local function mongo_add_database(label, url, protected)
+        table.insert(mongo_databases, { label = label, url = url, protected = protected })
         mongo_save()
-        vim.notify('Added MongoDB: ' .. label)
+        vim.notify('Added MongoDB: ' .. mongo_db_display(mongo_databases[#mongo_databases]))
+      end
+
+      local function mongo_current_marker(index)
+        if index ~= mongo_current_db then return '  ' end
+        return '* '
+      end
+
+      local function mongo_database_items(with_marker)
+        local items = {}
+        for index, db in ipairs(mongo_databases) do
+          local prefix = with_marker and mongo_current_marker(index) or ''
+          table.insert(items, prefix .. mongo_db_display(db))
+        end
+        return items
+      end
+
+      local function mongo_set_protection(idx, protected)
+        local db = mongo_databases[idx]
+        if not db then return end
+        db.protected = protected
+        mongo_save()
+        vim.notify((protected and 'Protected: ' or 'Unprotected: ') .. db.label)
+      end
+
+      local function mongo_toggle_protection()
+        vim.ui.select(mongo_database_items(), {
+          prompt = 'Toggle protection (confirm before every query):',
+        }, function(_, idx)
+          if not idx then return end
+          mongo_set_protection(idx, not mongo_is_protected(mongo_databases[idx]))
+        end)
       end
 
       local function mongo_select_database()
-        local items = {}
-        for i, db in ipairs(mongo_databases) do
-          local prefix = i == mongo_current_db and '* ' or '  '
-          table.insert(items, prefix .. db.label)
-        end
-
-        vim.ui.select(items, {
+        vim.ui.select(mongo_database_items(true), {
           prompt = 'Select MongoDB database:',
         }, function(_, idx)
           if idx then
             mongo_current_db = idx
             mongo_save()
             local db = mongo_get_current()
-            vim.notify('Selected: ' .. db.label)
+            vim.notify('Selected: ' .. mongo_db_display(db))
           end
         end)
       end
@@ -165,23 +199,301 @@ return {
         return nil
       end
 
-      local function mongo_wrap_query(code, raw)
-        if raw then
-          return code, nil
+      local function mongo_decoded_json_value(text)
+        local ok, value = pcall(vim.fn.json_decode, text)
+        if not ok then return nil end
+        return value
+      end
+
+      local mongo_section_marker = '@@MONGO_SECTION@@'
+      local mongo_section_end_marker = '@@MONGO_SECTION_END@@'
+
+      local function mongo_char_set(text)
+        local set = {}
+        for index = 1, #text do
+          set[text:sub(index, index)] = true
+        end
+        return set
+      end
+
+      local mongo_regex_allowed_before = mongo_char_set('([{,;:=!&|?+-*/%^~<>')
+      local mongo_open_brackets = mongo_char_set('([{')
+      local mongo_close_brackets = mongo_char_set(')]}')
+      local mongo_unfinished_tail = mongo_char_set('.,+-*/%=&|!<>?:^~([{')
+      local mongo_continuation_head = mongo_char_set('.,)]}+-*/%=&|<>?:^([`')
+
+      local mongo_declaration_keywords = {
+        ['const'] = true, ['let'] = true, ['var'] = true, ['function'] = true,
+        ['class'] = true, ['async'] = true, ['if'] = true, ['for'] = true,
+        ['while'] = true, ['do'] = true, ['switch'] = true, ['try'] = true,
+        ['throw'] = true, ['return'] = true, ['import'] = true, ['export'] = true,
+      }
+
+      local function mongo_strip_leading_trivia(text)
+        local rest = text:gsub('^%s+', '')
+        while true do
+          if rest:sub(1, 2) == '//' then
+            local line_end = rest:find('\n')
+            rest = line_end and rest:sub(line_end + 1):gsub('^%s+', '') or ''
+          elseif rest:sub(1, 2) == '/*' then
+            local comment_end = rest:find('*/', 3, true)
+            rest = comment_end and rest:sub(comment_end + 2):gsub('^%s+', '') or ''
+          else
+            return (rest:gsub('%s+$', ''))
+          end
+        end
+      end
+
+      -- Statements are also split on newlines, since mongosh scripts often omit semicolons.
+      local function mongo_split_statements(code)
+        local statements = {}
+        local stack = {}
+        local mode = 'code'
+        local start = 1
+        local index = 1
+        local last = nil
+
+        local function flush(stop)
+          local text = code:sub(start, stop)
+          if text:match('%S') then
+            table.insert(statements, text)
+          end
+          start = stop + 1
+          last = nil
         end
 
-        local tracked = mongo_detect_find_operation(code)
-        if not tracked then
-          return 'printjson(' .. code .. ')', nil
+        local function significant_after(from)
+          local cursor = from
+          while cursor <= #code do
+            local char = code:sub(cursor, cursor)
+            local pair = code:sub(cursor, cursor + 1)
+            if char:match('%s') then
+              cursor = cursor + 1
+            elseif pair == '//' then
+              cursor = (code:find('\n', cursor) or #code) + 1
+            elseif pair == '/*' then
+              local comment_end = code:find('*/', cursor + 2, true)
+              cursor = comment_end and comment_end + 2 or #code + 1
+            else
+              return char
+            end
+          end
+          return nil
         end
 
-        local wrapped = [[
-      const __mongoResult = (]] .. code .. [[);
-      const __mongoDocs = __mongoResult && typeof __mongoResult.toArray === 'function' ? __mongoResult.toArray() : __mongoResult;
-      print(EJSON.stringify(__mongoDocs, null, 2));
-      ]]
+        while index <= #code do
+          local char = code:sub(index, index)
+          local pair = code:sub(index, index + 1)
 
-        return wrapped, tracked
+          if mode == 'line_comment' then
+            if char == '\n' then
+              mode = 'code'
+            else
+              index = index + 1
+            end
+          elseif mode == 'block_comment' then
+            if pair == '*/' then
+              mode = 'code'
+              index = index + 2
+            else
+              index = index + 1
+            end
+          elseif mode == 'single' or mode == 'double' then
+            local quote = mode == 'single' and "'" or '"'
+            if char == '\\' then
+              index = index + 2
+            elseif char == quote then
+              mode = 'code'
+              last = quote
+              index = index + 1
+            else
+              index = index + 1
+            end
+          elseif mode == 'template' then
+            if char == '\\' then
+              index = index + 2
+            elseif pair == '${' then
+              table.insert(stack, 'template')
+              mode = 'code'
+              index = index + 2
+            elseif char == '`' then
+              mode = 'code'
+              last = '`'
+              index = index + 1
+            else
+              index = index + 1
+            end
+          elseif mode == 'regex' then
+            if char == '\\' then
+              index = index + 2
+            elseif char == '[' then
+              mode = 'regex_class'
+              index = index + 1
+            elseif char == '/' then
+              mode = 'code'
+              last = '/'
+              index = index + 1
+            else
+              index = index + 1
+            end
+          elseif mode == 'regex_class' then
+            if char == '\\' then
+              index = index + 2
+            elseif char == ']' then
+              mode = 'regex'
+              index = index + 1
+            else
+              index = index + 1
+            end
+          elseif pair == '//' then
+            mode = 'line_comment'
+            index = index + 2
+          elseif pair == '/*' then
+            mode = 'block_comment'
+            index = index + 2
+          elseif char == '/' and (last == nil or mongo_regex_allowed_before[last]) then
+            mode = 'regex'
+            index = index + 1
+          elseif char == "'" then
+            mode = 'single'
+            index = index + 1
+          elseif char == '"' then
+            mode = 'double'
+            index = index + 1
+          elseif char == '`' then
+            mode = 'template'
+            index = index + 1
+          elseif mongo_open_brackets[char] then
+            table.insert(stack, 'bracket')
+            last = char
+            index = index + 1
+          elseif mongo_close_brackets[char] then
+            if table.remove(stack) == 'template' then
+              mode = 'template'
+            else
+              last = char
+            end
+            index = index + 1
+          elseif char == ';' and #stack == 0 then
+            flush(index)
+            index = index + 1
+          elseif char == '\n' and #stack == 0 and last and not mongo_unfinished_tail[last] then
+            local head = significant_after(index + 1)
+            if head and not mongo_continuation_head[head] then
+              flush(index)
+            end
+            index = index + 1
+          else
+            if char:match('%S') then last = char end
+            index = index + 1
+          end
+        end
+
+        flush(#code)
+        return statements
+      end
+
+      local function mongo_is_expression(body)
+        if body == '' then return false end
+
+        local word = body:match('^[%a_$][%w_$]*')
+        return not (word and mongo_declaration_keywords[word])
+      end
+
+      local function mongo_emit_snippet(index, expression)
+        local meta = 'JSON.stringify(Array.isArray(__mongoDocs) ? { index: ' .. index
+          .. ', count: __mongoDocs.length } : { index: ' .. index .. ' })'
+
+        return table.concat({
+          'try {',
+          '  const __mongoValue = (',
+          expression,
+          '  );',
+          [[  const __mongoDocs = __mongoValue && typeof __mongoValue.toArray === 'function' ? __mongoValue.toArray() : __mongoValue;]],
+          [[  print(']] .. mongo_section_marker .. [[' + ]] .. meta .. ');',
+          [[  print(typeof __mongoDocs === 'undefined' ? 'undefined' : EJSON.stringify(__mongoDocs, null, 2));]],
+          '} catch (__mongoError) {',
+          [[  print(']] .. mongo_section_marker .. [[' + JSON.stringify({ index: ]] .. index .. [[, error: true }));]],
+          [[  print(String((__mongoError && __mongoError.message) || __mongoError));]],
+          '}',
+          [[print(']] .. mongo_section_end_marker .. [[');]],
+        }, '\n')
+      end
+
+      local function mongo_build_script(code)
+        local parts = {}
+        local sections = {}
+
+        for _, text in ipairs(mongo_split_statements(code)) do
+          local body = mongo_strip_leading_trivia(text)
+          if mongo_is_expression(body) then
+            local expression = body:gsub('%s*;%s*$', '')
+            table.insert(sections, { index = #sections + 1, statement = expression })
+            table.insert(parts, mongo_emit_snippet(#sections, expression))
+          else
+            table.insert(parts, text)
+          end
+        end
+
+        return table.concat(parts, '\n'), sections
+      end
+
+      local function mongo_parse_sections(output, sections)
+        local results = {}
+        local printed = {}
+        local current = nil
+
+        for _, line in ipairs(output) do
+          local meta_text = line:match('^' .. vim.pesc(mongo_section_marker) .. '(.*)$')
+          if meta_text then
+            local meta = mongo_decoded_json_value(meta_text) or {}
+            local section = sections[meta.index]
+            current = {
+              index = meta.index,
+              count = meta.count,
+              error = meta.error == true,
+              statement = section and section.statement or '',
+              lines = {},
+            }
+            table.insert(results, current)
+          elseif line == mongo_section_end_marker then
+            if current then
+              current.lines = mongo_trim_lines(current.lines)
+            end
+            current = nil
+          elseif current then
+            table.insert(current.lines, line)
+          elseif line ~= '' then
+            table.insert(printed, line)
+          end
+        end
+
+        if #printed > 0 then
+          table.insert(results, 1, { statement = '(printed output)', lines = printed })
+        end
+
+        return results
+      end
+
+      local function mongo_find_section(results, index)
+        for _, result in ipairs(results) do
+          if result.index == index then return result end
+        end
+        return nil
+      end
+
+      local function mongo_result_label(statement)
+        local label = statement:gsub('%s+', ' ')
+        if vim.fn.strchars(label) > 96 then
+          return vim.fn.strcharpart(label, 0, 95) .. '…'
+        end
+        return label
+      end
+
+      local function mongo_result_summary(result)
+        if result.error then return 'error' end
+        if not result.count then return 'value' end
+        return result.count .. (result.count == 1 and ' doc' or ' docs')
       end
 
       local function mongo_has_object_id(text)
@@ -193,7 +505,7 @@ return {
         return ok
       end
 
-      local function mongo_run_job(db, code, on_exit)
+      local function mongo_start_job(db, code, on_exit)
         local cmd = { 'mongosh', db.url, '--norc', '--quiet', '--eval', code }
         local env = { NO_COLOR = '1' }
         local output = {}
@@ -227,6 +539,57 @@ return {
         if job <= 0 then
           vim.notify('Failed to start mongosh', vim.log.levels.ERROR)
         end
+      end
+
+      local function mongo_close_window(win)
+        if vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_win_close(win, true)
+        end
+      end
+
+      local function mongo_confirm_lines(db, code)
+        return vim.list_extend({
+          'Database: ' .. db.label,
+          'URL:      ' .. db.url,
+          '',
+          '--- exact script that will run on this database ---',
+          '',
+        }, vim.split(code, '\n'))
+      end
+
+      local function mongo_confirm_run(db, code, on_confirm)
+        local _, win = mongo_open_float(mongo_confirm_lines(db, code), ' PROTECTED DB [' .. db.label .. '] ', 'javascript', { modifiable = false })
+
+        vim.cmd 'redraw'
+        vim.ui.input({ prompt = 'Type the database name (' .. db.label .. ') to allow: ' }, function(answer)
+          if vim.trim(answer or '') ~= db.label then
+            mongo_close_window(win)
+            vim.notify('Mongo run cancelled: database name did not match', vim.log.levels.WARN)
+            return
+          end
+
+          vim.ui.select({ 'Cancel', 'OK, run on ' .. db.label }, {
+            prompt = 'Run this script on ' .. db.label .. '?',
+          }, function(_, choice)
+            mongo_close_window(win)
+            if choice ~= 2 then
+              vim.notify('Mongo run cancelled', vim.log.levels.WARN)
+              return
+            end
+            on_confirm()
+          end)
+        end)
+      end
+
+      local function mongo_run_job(db, code, on_exit)
+        if not mongo_is_protected(db) then
+          mongo_start_job(db, code, on_exit)
+          return
+        end
+
+        mongo_confirm_run(db, code, function()
+          mongo_start_job(db, code, on_exit)
+        end)
       end
 
       local function mongo_ejson_preview_script(collection, edited_text)
@@ -434,18 +797,20 @@ return {
 
       local function mongo_refresh_result(buf)
         local q = mongo_result_queries[buf]
-        if not q then
+        if not q or not q.section then
           vim.notify('Not a refreshable Mongo result window', vim.log.levels.WARN)
           return
         end
 
-        local wrapped = mongo_wrap_query(q.code, q.raw)
-        mongo_run_job(q.db, wrapped, function(exit_code, output)
+        local script, sections = mongo_build_script(q.code)
+        mongo_run_job(q.db, script, function(exit_code, output)
           if exit_code ~= 0 then
             vim.notify('Mongo refresh failed (exit ' .. exit_code .. ')', vim.log.levels.ERROR)
             return
           end
-          if #output == 0 then
+
+          local result = mongo_find_section(mongo_parse_sections(output, sections), q.section)
+          if not result or #result.lines == 0 then
             vim.notify('Mongo refresh returned no output', vim.log.levels.WARN)
             return
           end
@@ -454,14 +819,96 @@ return {
           end
 
           local win = (vim.fn.win_findbuf(buf))[1] or -1
-          mongo_refresh_render(buf, win, output)
+          mongo_refresh_render(buf, win, result.lines)
 
           local state = mongo_tracked_buffers[buf]
           if state then
-            state.original_text = table.concat(output, '\n')
+            state.original_text = table.concat(result.lines, '\n')
           end
           vim.notify('Mongo result refreshed')
         end)
+      end
+
+      local function mongo_open_output_float(db, exit_code, output, errors)
+        local lines = vim.deepcopy(output)
+        for _, line in ipairs(errors or {}) do
+          table.insert(lines, '[stderr] ' .. line)
+        end
+        table.insert(lines, 1, '--- Mongosh Output (exit: ' .. exit_code .. ') ---')
+        table.insert(lines, 2, '--- Database: ' .. db.label .. ' ---')
+        table.insert(lines, 3, '')
+        mongo_open_float(lines, ' Mongosh [' .. db.label .. '] ', 'javascript')
+      end
+
+      local function mongo_register_result_keymaps(buf, db, code, result, collection)
+        if not result.index then return end
+
+        mongo_result_queries[buf] = { db = db, code = code, section = result.index, collection = collection }
+        vim.keymap.set('n', '<leader>mr', function()
+          mongo_refresh_result(buf)
+        end, { buffer = buf, desc = '[M]ongo [R]efresh result' })
+        vim.keymap.set('n', '<leader>ml', function()
+          mongo_show_links(buf)
+        end, { buffer = buf, desc = '[M]ongo [L]inks for document' })
+        vim.api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout' }, {
+          buffer = buf,
+          once = true,
+          callback = function()
+            mongo_result_queries[buf] = nil
+          end,
+        })
+      end
+
+      local function mongo_open_result_section(db, code, result)
+        if result.error then
+          mongo_open_float(result.lines, ' Mongo error [' .. db.label .. '] ', 'javascript')
+          return
+        end
+
+        local text = table.concat(result.lines, '\n')
+        local tracked = mongo_detect_find_operation(result.statement)
+        local title = ' Mongo result [' .. db.label .. '] '
+
+        if not tracked or not mongo_has_object_id(text) then
+          local plain_buf = mongo_open_float(result.lines, title, 'json')
+          mongo_register_result_keymaps(plain_buf, db, code, result, tracked and tracked.collection)
+          return
+        end
+
+        local buf, win = mongo_open_float(result.lines, title, 'json', {
+          bufhidden = 'hide',
+          buftype = 'acwrite',
+          name = 'mongo-result://' .. tracked.collection .. '/' .. tostring(vim.loop.hrtime()),
+        })
+        mongo_register_result_keymaps(buf, db, code, result, tracked.collection)
+        mongo_track_result_buffer(buf, win, {
+          db = db,
+          collection = tracked.collection,
+          original_text = text,
+        })
+      end
+
+      local function mongo_open_results_index(db, code, results)
+        local lines = {}
+        for position, result in ipairs(results) do
+          table.insert(lines, string.format('%2d  %-9s %s', position, mongo_result_summary(result), mongo_result_label(result.statement)))
+        end
+
+        local buf, win = mongo_open_float(lines, ' Mongo results [' .. db.label .. '] ', 'text', { modifiable = false })
+        vim.api.nvim_set_option_value('cursorline', true, { win = win })
+
+        vim.keymap.set('n', '<CR>', function()
+          local result = results[vim.api.nvim_win_get_cursor(win)[1]]
+          if result then
+            mongo_open_result_section(db, code, result)
+          end
+        end, { buffer = buf, desc = 'Open Mongo result' })
+
+        vim.keymap.set('n', 'q', function()
+          if vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_win_close(win, true)
+          end
+        end, { buffer = buf, desc = 'Close Mongo results' })
       end
 
       local function run_mongosh(input, is_file, opts)
@@ -472,66 +919,33 @@ return {
           return
         end
 
-        local code
-        if is_file then
-          local lines = vim.fn.readfile(input)
-          code = table.concat(lines, '\n')
-        else
-          code = input
+        local code = is_file and table.concat(vim.fn.readfile(input), '\n') or input
+        local script, sections = mongo_build_script(code)
+
+        if options.raw or #sections == 0 then
+          mongo_run_job(db, code, function(exit_code, output, errors)
+            mongo_open_output_float(db, exit_code, output, errors)
+          end)
+          return
         end
 
-        -- Strip trailing semicolons and whitespace, then wrap with printjson
-        code = code:gsub('%s*;%s*$', '')
-        local wrapped, tracked = mongo_wrap_query(code, options.raw)
-
-        mongo_run_job(db, wrapped, function(exit_code, output, errors)
-          if not tracked or exit_code ~= 0 then
-            for _, line in ipairs(errors) do
-              table.insert(output, '[stderr] ' .. line)
-            end
-            table.insert(output, 1, '--- Mongosh Output (exit: ' .. exit_code .. ') ---')
-            table.insert(output, 2, '--- Database: ' .. db.label .. ' ---')
-            table.insert(output, 3, '')
-            mongo_open_float(output, ' Mongosh [' .. db.label .. '] ', 'javascript')
+        mongo_run_job(db, script, function(exit_code, output, errors)
+          if exit_code ~= 0 then
+            mongo_open_output_float(db, exit_code, output, errors)
             return
           end
 
-          local function mongo_register_refresh(buf)
-            local detected = tracked or mongo_detect_find_operation(code)
-            mongo_result_queries[buf] = { db = db, code = code, raw = options.raw, collection = detected and detected.collection }
-            vim.keymap.set('n', '<leader>mr', function()
-              mongo_refresh_result(buf)
-            end, { buffer = buf, desc = '[M]ongo [R]efresh result' })
-            vim.keymap.set('n', '<leader>ml', function()
-              mongo_show_links(buf)
-            end, { buffer = buf, desc = '[M]ongo [L]inks for document' })
-            vim.api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout' }, {
-              buffer = buf,
-              once = true,
-              callback = function()
-                mongo_result_queries[buf] = nil
-              end,
-            })
+          local results = mongo_parse_sections(output, sections)
+          if #results == 0 then
+            mongo_open_output_float(db, exit_code, output, errors)
+            return
           end
-
-          local output_text = table.concat(output, '\n')
-          if not mongo_has_object_id(output_text) then
-            local plain_buf = mongo_open_float(output, ' Mongo result [' .. db.label .. '] ', 'json')
-            mongo_register_refresh(plain_buf)
+          if #results == 1 then
+            mongo_open_result_section(db, code, results[1])
             return
           end
 
-          local buf, win = mongo_open_float(output, ' Mongo result [' .. db.label .. '] ', 'json', {
-            bufhidden = 'hide',
-            buftype = 'acwrite',
-            name = 'mongo-result://' .. tracked.collection .. '/' .. tostring(vim.loop.hrtime()),
-          })
-          mongo_register_refresh(buf)
-          mongo_track_result_buffer(buf, win, {
-            db = db,
-            collection = tracked.collection,
-            original_text = output_text,
-          })
+          mongo_open_results_index(db, code, results)
         end)
       end
 
@@ -565,21 +979,32 @@ return {
       vim.keymap.set('n', '<leader>ms', mongo_select_database, { desc = '[M]ongo [S]elect database' })
 
       -- Add new MongoDB database
+      local function mongo_prompt_protection(label, url)
+        vim.ui.select({ 'Normal database', 'Protected (production primary)' }, {
+          prompt = 'Protection level for ' .. label .. ':',
+        }, function(_, choice)
+          if not choice then return end
+          mongo_add_database(label, url, choice == 2)
+        end)
+      end
+
       vim.keymap.set('n', '<leader>ma', function()
         vim.ui.input({ prompt = 'Database label: ' }, function(label)
           if not label or label == '' then return end
           vim.ui.input({ prompt = 'MongoDB URL: ' }, function(url)
             if not url or url == '' then return end
-            mongo_add_database(label, url)
+            mongo_prompt_protection(label, url)
           end)
         end)
       end, { desc = '[M]ongo [A]dd database' })
+
+      vim.keymap.set('n', '<leader>mp', mongo_toggle_protection, { desc = '[M]ongo toggle [P]rotection' })
 
       -- Show current MongoDB database
       vim.keymap.set('n', '<leader>mc', function()
         local db = mongo_get_current()
         if db then
-          vim.notify('Current DB: ' .. db.label .. '\nURL: ' .. db.url)
+          vim.notify('Current DB: ' .. mongo_db_display(db) .. '\nURL: ' .. db.url)
         else
           vim.notify('No database selected', vim.log.levels.WARN)
         end
@@ -592,12 +1017,7 @@ return {
           return
         end
 
-        local items = {}
-        for _, db in ipairs(mongo_databases) do
-          table.insert(items, db.label)
-        end
-
-        vim.ui.select(items, {
+        vim.ui.select(mongo_database_items(), {
           prompt = 'Delete MongoDB database:',
         }, function(_, idx)
           if idx then
@@ -624,12 +1044,6 @@ return {
         if not key_node then return nil end
 
         return vim.treesitter.get_node_text(key_node, 0):gsub('^["\']', ''):gsub('["\']$', '')
-      end
-
-      local function mongo_decoded_json_value(text)
-        local ok, value = pcall(vim.fn.json_decode, text)
-        if not ok then return nil end
-        return value
       end
 
       local function mongo_table_key_count(value)
