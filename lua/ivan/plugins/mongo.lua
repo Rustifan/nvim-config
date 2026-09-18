@@ -12,8 +12,47 @@ return {
       }
       local mongo_current_db = 1 -- Index of currently selected database
 
+      -- urls are mongosh connection strings, so the scheme is optional: db4.kompare.pw/kompare is valid
+      local function mongo_split_url(url)
+        local scheme, rest = url:match '^([%w%+]+://)(.*)$'
+        local body, query = (rest or url):match '^([^?]*)(%?.*)$'
+        local authority, database = (body or rest or url):match '^([^/]*)/(.*)$'
+        return {
+          scheme = scheme or '',
+          authority = authority or body or rest or url,
+          database = database ~= '' and database or nil,
+          query = query or '',
+        }
+      end
+
+      local function mongo_url_db(url)
+        return mongo_split_url(url).database
+      end
+
+      local function mongo_url_with_db(url, database)
+        local parts = mongo_split_url(url)
+        return parts.scheme .. parts.authority .. '/' .. database .. parts.query
+      end
+
+      local function mongo_url_without_db(url)
+        local parts = mongo_split_url(url)
+        local separator = parts.query ~= '' and '/' or ''
+        return parts.scheme .. parts.authority .. separator .. parts.query
+      end
+
+      -- the database belongs in the entry, not in the url, so a picked one always wins
+      local function mongo_stored_entry(db)
+        return {
+          label = db.label,
+          url = mongo_url_without_db(db.url),
+          database = db.database or mongo_url_db(db.url),
+          protected = db.protected,
+        }
+      end
+
       local function mongo_save()
-        local data = vim.fn.json_encode({ databases = mongo_databases, current = mongo_current_db })
+        local entries = vim.tbl_map(mongo_stored_entry, mongo_databases)
+        local data = vim.fn.json_encode({ databases = entries, current = mongo_current_db })
         vim.fn.writefile({ data }, mongo_data_file)
       end
 
@@ -24,7 +63,7 @@ return {
             local ok, data = pcall(vim.fn.json_decode, content[1])
             if ok and data then
               if data.databases and #data.databases > 0 then
-                mongo_databases = data.databases
+                mongo_databases = vim.tbl_map(mongo_stored_entry, data.databases)
               end
               if data.current and data.current >= 1 and data.current <= #mongo_databases then
                 mongo_current_db = data.current
@@ -41,17 +80,40 @@ return {
         return mongo_databases[mongo_current_db]
       end
 
+      local function mongo_with_current_db(on_db)
+        local db = mongo_get_current()
+        if not db then
+          vim.notify('No MongoDB database selected!', vim.log.levels.ERROR)
+          return
+        end
+        on_db(db)
+      end
+
       local function mongo_is_protected(db)
         return db ~= nil and db.protected == true
       end
 
+      local function mongo_active_db(db)
+        return db.database or mongo_url_db(db.url)
+      end
+
+      local function mongo_active_url(db)
+        local database = mongo_active_db(db)
+        if not database then return db.url end
+        return mongo_url_with_db(db.url, database)
+      end
+
+      local function mongo_db_suffix(db)
+        return '  › ' .. (mongo_active_db(db) or '(no db)')
+      end
+
       local function mongo_db_display(db)
-        if not mongo_is_protected(db) then return db.label end
-        return db.label .. '  [PROTECTED]'
+        local protection = mongo_is_protected(db) and '  [PROTECTED]' or ''
+        return db.label .. mongo_db_suffix(db) .. protection
       end
 
       local function mongo_add_database(label, url, protected)
-        table.insert(mongo_databases, { label = label, url = url, protected = protected })
+        table.insert(mongo_databases, mongo_stored_entry({ label = label, url = url, protected = protected }))
         mongo_save()
         vim.notify('Added MongoDB: ' .. mongo_db_display(mongo_databases[#mongo_databases]))
       end
@@ -153,6 +215,10 @@ return {
       local mongo_float_zindex = 40
       local mongo_confirm_zindex = 45
 
+      local function mongo_float_height(line_count)
+        return math.min(line_count + 3, vim.o.lines - 6)
+      end
+
       local function mongo_open_float(lines, title, filetype, opts)
         local options = opts or {}
         local buf = vim.api.nvim_create_buf(false, true)
@@ -167,7 +233,7 @@ return {
         vim.api.nvim_set_option_value('filetype', filetype, { buf = buf })
 
         local width = math.min(120, vim.o.columns - 6)
-        local height = math.min(#lines + 3, vim.o.lines - 6)
+        local height = mongo_float_height(#lines)
         local win = vim.api.nvim_open_win(buf, true, {
           relative = 'editor',
           width = width,
@@ -178,6 +244,8 @@ return {
           border = 'rounded',
           title = title,
           title_pos = 'center',
+          footer = options.footer,
+          footer_pos = options.footer and 'center' or nil,
           zindex = options.zindex or mongo_float_zindex,
         })
 
@@ -190,14 +258,14 @@ return {
 
       local function mongo_detect_find_operation(code)
         local trimmed = code:gsub('^%s+', ''):gsub('%s+$', '')
-        local collection = trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%.findOne%s*%(")
-          or trimmed:match('^db%.([%w_%-]+)%.findOne%s*%(')
+        local collection = trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%s*%.findOne%s*%(")
+          or trimmed:match('^db%.([%w_%-]+)%s*%.findOne%s*%(')
         if collection then
           return { collection = collection, operation = 'findOne' }
         end
 
-        collection = trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%.find%s*%(")
-          or trimmed:match('^db%.([%w_%-]+)%.find%s*%(')
+        collection = trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%s*%.find%s*%(")
+          or trimmed:match('^db%.([%w_%-]+)%s*%.find%s*%(')
         if collection then
           return { collection = collection, operation = 'find' }
         end
@@ -519,7 +587,7 @@ return {
       end
 
       local function mongo_command(db, flag, script)
-        return { 'mongosh', db.url, '--norc', '--quiet', flag, script }
+        return { 'mongosh', mongo_active_url(db), '--norc', '--quiet', flag, script }
       end
 
       local function mongo_start_job(db, code, on_exit)
@@ -563,50 +631,155 @@ return {
         end
       end
 
+      local mongo_list_databases_script =
+        'JSON.stringify(db.adminCommand({ listDatabases: 1, nameOnly: true }).databases.map(entry => entry.name))'
+
+      local function mongo_set_db(db, database)
+        db.database = database
+        mongo_save()
+        vim.notify('Using database: ' .. mongo_db_display(db))
+      end
+
+      local function mongo_input_db(db, on_done)
+        vim.ui.input({ prompt = 'Database name on ' .. db.label .. ': ' }, function(name)
+          if not name or name == '' then return end
+          mongo_set_db(db, vim.trim(name))
+          if on_done then on_done() end
+        end)
+      end
+
+      local function mongo_parse_names(exit_code, output)
+        if exit_code ~= 0 or #output == 0 then return nil end
+        local ok, names = pcall(vim.fn.json_decode, table.concat(output, ''))
+        if not ok or type(names) ~= 'table' or #names == 0 then return nil end
+        return names
+      end
+
+      local function mongo_pick_db(db, on_done)
+        mongo_start_job(db, mongo_list_databases_script, function(exit_code, output, errors)
+          local names = mongo_parse_names(exit_code, output)
+          if not names then
+            vim.notify('Could not list databases on ' .. db.label .. ': ' .. (errors[1] or output[1] or 'no output'), vim.log.levels.WARN)
+            mongo_input_db(db, on_done)
+            return
+          end
+
+          vim.ui.select(names, { prompt = 'Use database on ' .. db.label .. ':' }, function(name)
+            if not name then return end
+            mongo_set_db(db, name)
+            if on_done then on_done() end
+          end)
+        end)
+      end
+
+      local mongo_list_collections_script = 'JSON.stringify(db.getCollectionNames())'
+
+      local function mongo_collection_accessor(collection)
+        if collection:match '^[%a_][%w_]*$' then return 'db.' .. collection end
+        return "db.getCollection('" .. collection .. "')"
+      end
+
+      local function mongo_find_snippet(collection)
+        return {
+          mongo_collection_accessor(collection),
+          '    .find({})',
+          '    .sort({_id: -1})',
+          '    .limit(10)',
+        }
+      end
+
+      local function mongo_insert_lines(win, lines)
+        if not vim.api.nvim_win_is_valid(win) then return end
+        local buf = vim.api.nvim_win_get_buf(win)
+        local row = vim.api.nvim_win_get_cursor(win)[1]
+        local current = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ''
+        local start = vim.trim(current) == '' and row - 1 or row
+        vim.api.nvim_buf_set_lines(buf, start, row, false, lines)
+        vim.api.nvim_win_set_cursor(win, { start + 1, 0 })
+      end
+
+      local function mongo_pick_collection(db, win)
+        mongo_start_job(db, mongo_list_collections_script, function(exit_code, output, errors)
+          local names = mongo_parse_names(exit_code, output)
+          if not names then
+            vim.notify('Could not list collections on ' .. db.label .. ': ' .. (errors[1] or output[1] or 'no output'), vim.log.levels.WARN)
+            return
+          end
+
+          vim.ui.select(names, { prompt = 'Collection on ' .. mongo_db_display(db) .. ':' }, function(name)
+            if not name then return end
+            mongo_insert_lines(win, mongo_find_snippet(name))
+          end)
+        end)
+      end
+
       local function mongo_close_window(win)
         if vim.api.nvim_win_is_valid(win) then
           vim.api.nvim_win_close(win, true)
         end
       end
 
-      local function mongo_confirm_lines(db, code)
-        return vim.list_extend({
-          'Database: ' .. db.label,
-          'URL:      ' .. db.url,
-          '',
-          '--- exact script that will run on this database ---',
-          '',
-        }, vim.split(code, '\n'))
+      local function mongo_close_keymaps(buf, win, desc)
+        local close = function()
+          mongo_close_window(win)
+        end
+        vim.keymap.set('n', 'q', close, { buffer = buf, desc = desc })
+        vim.keymap.set('n', '<Esc>', close, { buffer = buf, desc = desc })
       end
 
-      local function mongo_confirm_run(db, code, on_confirm)
-        local _, win = mongo_open_float(mongo_confirm_lines(db, code), ' PROTECTED DB [' .. db.label .. '] ', 'javascript', {
-          modifiable = false,
-          zindex = mongo_confirm_zindex,
-        })
+      local function mongo_confirm_lines(db, code)
+        return vim.list_extend({ '// ' .. mongo_active_url(db), '' }, vim.split(code, '\n'))
+      end
 
-        vim.cmd 'redraw'
-        vim.ui.input({ prompt = 'Type the database name (' .. db.label .. ') to allow: ' }, function(answer)
+      local function mongo_set_lines(buf, lines)
+        vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
+      end
+
+      local function mongo_ask_database_name(db, win, on_confirm)
+        vim.ui.input({ prompt = 'Type ' .. db.label .. ' to run: ' }, function(answer)
+          mongo_close_window(win)
           if vim.trim(answer or '') ~= db.label then
-            mongo_close_window(win)
             vim.notify('Mongo run cancelled: database name did not match', vim.log.levels.WARN)
             return
           end
-
-          vim.ui.select({ 'Cancel', 'OK, run on ' .. db.label }, {
-            prompt = 'Run this script on ' .. db.label .. '?',
-          }, function(_, choice)
-            mongo_close_window(win)
-            if choice ~= 2 then
-              vim.notify('Mongo run cancelled', vim.log.levels.WARN)
-              return
-            end
-            on_confirm()
-          end)
+          on_confirm()
         end)
       end
 
-      local function mongo_run_job(db, code, on_exit)
+      local function mongo_confirm_run(db, code, on_confirm, display_code)
+        local shown = display_code or code
+        local wraps_code = shown ~= code
+        local views = { mongo_confirm_lines(db, shown), mongo_confirm_lines(db, code) }
+        local buf, win = mongo_open_float(views[1], ' PROTECTED DB [' .. db.label .. '] ', 'javascript', {
+          modifiable = false,
+          zindex = mongo_confirm_zindex,
+          footer = wraps_code and ' <CR> run · <Tab> wrapped script · q cancel ' or ' <CR> run · q cancel ',
+        })
+
+        local view = 1
+        if wraps_code then
+          vim.keymap.set('n', '<Tab>', function()
+            view = view == 1 and 2 or 1
+            mongo_set_lines(buf, views[view])
+            vim.api.nvim_win_set_height(win, mongo_float_height(#views[view]))
+          end, { buffer = buf, desc = 'Toggle wrapped Mongo script' })
+        end
+
+        local function cancel()
+          mongo_close_window(win)
+          vim.notify('Mongo run cancelled', vim.log.levels.WARN)
+        end
+
+        vim.keymap.set('n', 'q', cancel, { buffer = buf, desc = 'Cancel Mongo run' })
+        vim.keymap.set('n', '<Esc>', cancel, { buffer = buf, desc = 'Cancel Mongo run' })
+        vim.keymap.set('n', '<CR>', function()
+          mongo_ask_database_name(db, win, on_confirm)
+        end, { buffer = buf, desc = 'Confirm Mongo run' })
+      end
+
+      local function mongo_run_job(db, code, on_exit, display_code)
         if not mongo_is_protected(db) then
           mongo_start_job(db, code, on_exit)
           return
@@ -614,7 +787,7 @@ return {
 
         mongo_confirm_run(db, code, function()
           mongo_start_job(db, code, on_exit)
-        end)
+        end, display_code)
       end
 
       local function mongo_ejson_preview_script(collection, edited_text)
@@ -813,7 +986,7 @@ return {
         vim.api.nvim_set_option_value('modified', false, { buf = buf })
 
         if win >= 0 and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative ~= '' then
-          vim.api.nvim_win_set_height(win, math.min(#lines + 3, vim.o.lines - 6))
+          vim.api.nvim_win_set_height(win, mongo_float_height(#lines))
         end
 
         if cursor and win >= 0 and vim.api.nvim_win_is_valid(win) then
@@ -853,7 +1026,7 @@ return {
             state.original_text = table.concat(result.lines, '\n')
           end
           vim.notify('Mongo result refreshed')
-        end)
+        end, q.code)
       end
 
       local function mongo_open_output_float(db, exit_code, output, errors)
@@ -931,11 +1104,7 @@ return {
           end
         end, { buffer = buf, desc = 'Open Mongo result' })
 
-        vim.keymap.set('n', 'q', function()
-          if vim.api.nvim_win_is_valid(win) then
-            vim.api.nvim_win_close(win, true)
-          end
-        end, { buffer = buf, desc = 'Close Mongo results' })
+        mongo_close_keymaps(buf, win, 'Close Mongo results')
       end
 
       local function run_mongosh(input, is_file, opts)
@@ -943,6 +1112,13 @@ return {
         local db = mongo_get_current()
         if not db then
           vim.notify('No MongoDB database selected!', vim.log.levels.ERROR)
+          return
+        end
+
+        if not mongo_active_db(db) then
+          mongo_pick_db(db, function()
+            run_mongosh(input, is_file, opts)
+          end)
           return
         end
 
@@ -973,7 +1149,7 @@ return {
           end
 
           mongo_open_results_index(db, code, results)
-        end)
+        end, code)
       end
 
       -- Normal mode: run current file
@@ -1005,6 +1181,30 @@ return {
       -- Select MongoDB database
       vim.keymap.set('n', '<leader>ms', mongo_select_database, { desc = '[M]ongo [S]elect database' })
 
+      -- Switch the database used on the current connection
+      vim.keymap.set('n', '<leader>mb', function()
+        mongo_with_current_db(mongo_pick_db)
+      end, { desc = '[M]ongo switch data[b]ase' })
+
+      -- Insert a find query for a collection of the current database
+      vim.keymap.set('n', '<leader>mo', function()
+        if not vim.bo.modifiable then
+          vim.notify('Current buffer is not modifiable', vim.log.levels.WARN)
+          return
+        end
+
+        local win = vim.api.nvim_get_current_win()
+        mongo_with_current_db(function(db)
+          if not mongo_active_db(db) then
+            mongo_pick_db(db, function()
+              mongo_pick_collection(db, win)
+            end)
+            return
+          end
+          mongo_pick_collection(db, win)
+        end)
+      end, { desc = '[M]ongo insert c[o]llection query' })
+
       -- Add new MongoDB database
       local function mongo_prompt_protection(label, url)
         vim.ui.select({ 'Normal database', 'Protected (production primary)' }, {
@@ -1028,13 +1228,30 @@ return {
       vim.keymap.set('n', '<leader>mp', mongo_toggle_protection, { desc = '[M]ongo toggle [P]rotection' })
 
       -- Show current MongoDB database
+      local function mongo_status_rows(db)
+        return {
+          { 'Connection', string.format('%s  (%d of %d)', db.label, mongo_current_db, #mongo_databases) },
+          { 'Protected', mongo_is_protected(db) and 'yes — confirm before every query' or 'no' },
+          { 'Server URL', db.url },
+          { 'Database', mongo_active_db(db) or '— none, you will be asked on next query' },
+          { 'Runs against', mongo_active_url(db) },
+        }
+      end
+
+      local function mongo_status_lines(db)
+        return vim.tbl_map(function(row)
+          return string.format('%-13s %s', row[1], row[2])
+        end, mongo_status_rows(db))
+      end
+
       vim.keymap.set('n', '<leader>mc', function()
-        local db = mongo_get_current()
-        if db then
-          vim.notify('Current DB: ' .. mongo_db_display(db) .. '\nURL: ' .. db.url)
-        else
-          vim.notify('No database selected', vim.log.levels.WARN)
-        end
+        mongo_with_current_db(function(db)
+          local buf, win = mongo_open_float(mongo_status_lines(db), ' Mongo status ', 'text', {
+            modifiable = false,
+            footer = ' <leader>ms connection · <leader>mb database · <leader>mo collection · q close ',
+          })
+          mongo_close_keymaps(buf, win, 'Close Mongo status')
+        end)
       end, { desc = '[M]ongo show [C]urrent database' })
 
       -- Delete a MongoDB database
