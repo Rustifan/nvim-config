@@ -10,7 +10,7 @@ vim.o.mouse = 'a'
 vim.o.showmode = false
 vim.o.swapfile = false
 -- SSH sessions use the connecting terminal's clipboard, not the remote host's.
-if vim.env.SSH_TTY then
+if vim.env.SSH_TTY or vim.env.SSH_CONNECTION then
   local osc52 = require('vim.ui.clipboard.osc52')
   vim.g.clipboard = {
     name = 'OSC 52',
