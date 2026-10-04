@@ -2,6 +2,7 @@ local data_file = vim.fn.stdpath 'data' .. '/claude_edit.json'
 local models = { 'haiku', 'sonnet', 'opus', 'fable' }
 local default_model = 'sonnet'
 local thinking_effort = 'high'
+local backends = { opencode = require 'ivan.opencode', claude = { label = 'Claude', default_model = default_model } }
 local namespace = vim.api.nvim_create_namespace 'ivan-claude'
 local pending_hl = 'DiffChange'
 local reference_hl = 'Underlined'
@@ -12,7 +13,7 @@ local line_suffix_pattern = '^:(%d+)()'
 local bare_line_pattern = '()[Ll]ines? (%d+)()'
 local named_file_pattern = '^%s+[io][fn]%s+[`*_]*()'
 local border_size = 2
-local location_list_title = 'Claude references'
+local location_list_title = 'AI references'
 
 local read_tools = 'Read,Glob,Grep'
 
@@ -87,7 +88,7 @@ local prettify_instruction = sentences(
 )
 
 local function notify(message, level)
-  vim.notify('Claude: ' .. message, level)
+  vim.notify('AI: ' .. message, level)
 end
 
 local function read_preferences()
@@ -101,7 +102,8 @@ end
 local preferences = read_preferences()
 
 local state = {
-  model = vim.tbl_contains(models, preferences.model) and preferences.model or default_model,
+  backend = backends[preferences.backend] and preferences.backend or 'opencode',
+  backend_models = preferences.backend_models or { claude = vim.tbl_contains(models, preferences.model) and preferences.model or default_model },
   thinking = preferences.thinking == true,
   last_request = nil,
   last_exchange = nil,
@@ -109,8 +111,14 @@ local state = {
   applied = nil,
 }
 
+state.model = state.backend_models[state.backend] or backends[state.backend].default_model
+
 local function save_preferences()
-  vim.fn.writefile({ vim.json.encode { model = state.model, thinking = state.thinking } }, data_file)
+  state.backend_models[state.backend] = state.model
+  vim.fn.writefile(
+    { vim.json.encode { backend = state.backend, backend_models = state.backend_models, model = state.model, thinking = state.thinking } },
+    data_file
+  )
 end
 
 local function split_lines(text)
@@ -368,7 +376,7 @@ end
 
 local function failure_message(result)
   local output = vim.trim(result.stderr ~= '' and result.stderr or result.stdout)
-  return output ~= '' and output or 'claude exited with code ' .. result.code
+  return output ~= '' and output or 'process exited with code ' .. result.code
 end
 
 local function decode_events(stdout)
@@ -403,6 +411,9 @@ local function thinking_text(events)
 end
 
 local function parse_response(result)
+  if result.code ~= 0 then
+    return nil, failure_message(result)
+  end
   local events = decode_events(result.stdout)
   local response = vim.iter(events):find(function(event)
     return event.type == 'result'
@@ -414,6 +425,14 @@ local function parse_response(result)
     return nil, tostring(response.result or response.subtype or failure_message(result))
   end
   return { text = response.result, structured = response.structured_output, thoughts = thinking_text(events) }
+end
+
+backends.claude.prepare = function(handler, model, thinking, prompt)
+  return claude_command(handler, model, thinking), { stdin = prompt }
+end
+backends.claude.parse = parse_response
+backends.claude.models = function(callback)
+  callback(models)
 end
 
 local function join_hints(groups)
@@ -596,7 +615,7 @@ end
 local function apply_edit(exchange)
   local request, result = exchange.request, exchange.structured
   if type(result) ~= 'table' or type(result.replacement) ~= 'string' then
-    return notify('Claude returned no edit (<leader>cr to retry)', vim.log.levels.ERROR)
+    return notify('returned no edit (<leader>cr to retry)', vim.log.levels.ERROR)
   end
   if not request_range(request) then
     return notify('the edited region no longer exists', vim.log.levels.WARN)
@@ -948,9 +967,9 @@ local function attach_references(request, buf, win, references)
   highlight_references(buf, references)
   map('<CR>', reference_at, function(reference)
     jump_to_reference(request, reference, win)
-  end, 'Jump to Claude reference')
-  map('<Tab>', next_reference, move, 'Next Claude reference')
-  map('<S-Tab>', previous_reference, move, 'Previous Claude reference')
+  end, 'Jump to AI reference')
+  map('<Tab>', next_reference, move, 'Next AI reference')
+  map('<S-Tab>', previous_reference, move, 'Previous AI reference')
 end
 
 local function answer_footer(answer, references)
@@ -1001,7 +1020,7 @@ end
 
 local function open_answer(answer)
   local references = find_references(answer.request, answer.lines)
-  local buf, win = open_float(answer.lines, ' Claude · ' .. answer.model .. ' ', answer_footer(answer, references))
+  local buf, win = open_float(answer.lines, ' ' .. backends[answer.backend].label .. ' · ' .. answer.model .. ' ', answer_footer(answer, references))
   vim.b[buf].claude_answer = true
   vim.api.nvim_win_call(win, function()
     vim.fn.winrestview(answer.view)
@@ -1059,14 +1078,14 @@ local handlers = {
     on_result = apply_rewrite,
     label = 'editing',
     numbered = false,
-    follow_up_prompt = 'Claude refine edit: ',
+    follow_up_prompt = 'AI refine edit: ',
   },
   edit = {
     system_prompt = edit_system_prompt,
     on_result = apply_edit,
     label = 'editing',
     numbered = false,
-    follow_up_prompt = 'Claude refine edit: ',
+    follow_up_prompt = 'AI refine edit: ',
     tools = read_tools,
     schema = edit_schema,
   },
@@ -1075,7 +1094,7 @@ local handlers = {
     on_result = show_answer,
     label = 'asking',
     numbered = true,
-    follow_up_prompt = 'Claude follow-up: ',
+    follow_up_prompt = 'AI follow-up: ',
     tools = read_tools,
   },
 }
@@ -1083,30 +1102,37 @@ local handlers = {
 local function run(request)
   local handler = handlers[request.kind]
   local model, thinking = state.model, state.thinking
+  local backend_name = state.backend
+  local backend = backends[backend_name]
   state.last_request = request
   set_mark_highlight(request, pending_hl)
-  notify(string.format('%s with %s%s…', handler.label, model, thinking and ' + thinking' or ''))
+  notify(string.format('%s with %s · %s%s…', handler.label, backend.label, model, thinking and ' + thinking' or ''))
 
   local on_exit = vim.schedule_wrap(function(result)
     set_mark_highlight(request, nil)
-    local response, err = parse_response(result)
+    local response, err = backend.parse(result, handler)
     if not response then
       return notify(err, vim.log.levels.ERROR)
     end
-    state.last_exchange = vim.tbl_extend('force', response, { request = request, thinking = thinking, model = model })
+    state.last_exchange = vim.tbl_extend('force', response, { request = request, thinking = thinking, model = model, backend = backend_name })
     handler.on_result(state.last_exchange)
   end)
 
-  local started, err = pcall(vim.system, claude_command(handler, model, thinking), {
-    stdin = build_prompt(request, handler.numbered),
-    cwd = request.cwd,
-    text = true,
-  }, on_exit)
+  local command, options = backend.prepare(handler, model, thinking, build_prompt(request, handler.numbered))
+  local started, err = pcall(
+    vim.system,
+    command,
+    vim.tbl_extend('force', options, {
+      cwd = request.cwd,
+      text = true,
+    }),
+    on_exit
+  )
   if started then
     return
   end
   set_mark_highlight(request, nil)
-  notify('failed to start claude: ' .. tostring(err), vim.log.levels.ERROR)
+  notify('failed to start ' .. backend.label .. ': ' .. tostring(err), vim.log.levels.ERROR)
 end
 
 local function ask_input(prompt, on_input)
@@ -1171,7 +1197,7 @@ local function thinking_problem(exchange)
     return 'thinking was off for this result (<leader>ct turns it on, <leader>cr reruns)'
   end
   if not exchange.thoughts then
-    return 'Claude did not need to think for this one'
+    return 'no thinking was returned for this result'
   end
   return nil
 end
@@ -1182,7 +1208,7 @@ local function show_thinking()
   if problem then
     return notify(problem, vim.log.levels.WARN)
   end
-  open_float(split_lines(exchange.thoughts), ' Claude thinking · ' .. exchange.model .. ' ', ' :q back ')
+  open_float(split_lines(exchange.thoughts), ' ' .. backends[exchange.backend].label .. ' thinking · ' .. exchange.model .. ' ', ' :q back ')
 end
 
 local function toggle_thinking()
@@ -1192,31 +1218,64 @@ local function toggle_thinking()
 end
 
 local function select_model()
-  vim.ui.select(models, {
-    prompt = 'Claude model',
-    format_item = function(model)
-      return model == state.model and model .. ' (current)' or model
-    end,
-  }, function(model)
-    if not model then
-      return
-    end
-    state.model = model
-    save_preferences()
-    notify('model set to ' .. model)
+  local backend_name = state.backend
+  backends[backend_name].models(function(available_models)
+    vim.ui.select(available_models, {
+      prompt = backends[backend_name].label .. ' model',
+      format_item = function(model)
+        return model == state.model and model .. ' (current)' or model
+      end,
+    }, function(model)
+      if not model or state.backend ~= backend_name then
+        return
+      end
+      state.model = model
+      save_preferences()
+      notify('model set to ' .. model)
+    end)
   end)
 end
 
-local function setup()
-  vim.keymap.set({ 'n', 'v' }, '<leader>cp', on_current_range(prettify), { desc = '[C]laude [P]rettify selection or file' })
-  vim.keymap.set({ 'n', 'v' }, '<leader>ce', on_current_range(prompted('edit', 'Claude edit: ')), { desc = '[C]laude [E]dit with prompt' })
-  vim.keymap.set({ 'n', 'v' }, '<leader>ca', on_current_range(prompted('ask', 'Ask Claude: ')), { desc = '[C]laude [A]sk about selection or file' })
-  vim.keymap.set('n', '<leader>cr', retry, { desc = '[C]laude [R]etry last request' })
-  vim.keymap.set('n', '<leader>cf', follow_up, { desc = '[C]laude [F]ollow up on the last answer or edit' })
-  vim.keymap.set('n', '<leader>cw', show_thinking, { desc = '[C]laude [W]hy: show thinking behind the last result' })
-  vim.keymap.set('n', '<leader>ct', toggle_thinking, { desc = '[C]laude [T]hinking on/off' })
-  vim.keymap.set('n', '<leader>co', reopen_answer, { desc = '[C]laude re[O]pen last answer' })
-  vim.keymap.set('n', '<leader>cm', select_model, { desc = '[C]laude select [M]odel' })
+local function select_backend()
+  vim.ui.select(vim.fn.sort(vim.tbl_keys(backends)), {
+    prompt = 'AI backend',
+    format_item = function(name)
+      return backends[name].label .. (name == state.backend and ' (current)' or '')
+    end,
+  }, function(name)
+    if not name then
+      return
+    end
+    state.backend_models[state.backend] = state.model
+    state.backend = name
+    state.model = state.backend_models[name] or backends[name].default_model
+    save_preferences()
+    notify('backend set to ' .. backends[name].label .. ' · ' .. state.model)
+  end)
+end
+
+local function setup(opts)
+  opts = opts or {}
+  backends = vim.tbl_extend('force', backends, opts.backends or {})
+  local selected_backend = opts.backend or preferences.backend
+  if selected_backend and backends[selected_backend] then
+    state.backend = selected_backend
+    state.model = state.backend_models[state.backend] or backends[state.backend].default_model
+  end
+  if opts.backend then
+    assert(backends[opts.backend], 'Unknown AI backend: ' .. opts.backend)
+  end
+  state.model = opts.model or state.model
+  vim.keymap.set('n', '<leader>cb', select_backend, { desc = 'AI select [B]ackend' })
+  vim.keymap.set({ 'n', 'v' }, '<leader>cp', on_current_range(prettify), { desc = 'AI [P]rettify selection or file' })
+  vim.keymap.set({ 'n', 'v' }, '<leader>ce', on_current_range(prompted('edit', 'AI edit: ')), { desc = 'AI [E]dit with prompt' })
+  vim.keymap.set({ 'n', 'v' }, '<leader>ca', on_current_range(prompted('ask', 'Ask AI: ')), { desc = 'AI [A]sk about selection or file' })
+  vim.keymap.set('n', '<leader>cr', retry, { desc = 'AI [R]etry last request' })
+  vim.keymap.set('n', '<leader>cf', follow_up, { desc = 'AI [F]ollow up on the last answer or edit' })
+  vim.keymap.set('n', '<leader>cw', show_thinking, { desc = 'AI [W]hy: show thinking behind the last result' })
+  vim.keymap.set('n', '<leader>ct', toggle_thinking, { desc = 'AI [T]hinking on/off' })
+  vim.keymap.set('n', '<leader>co', reopen_answer, { desc = 'AI re[O]pen last answer' })
+  vim.keymap.set('n', '<leader>cm', select_model, { desc = 'AI select [M]odel' })
 end
 
 return { setup = setup }

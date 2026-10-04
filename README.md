@@ -1,5 +1,39 @@
 # kickstart.nvim
 
+## AI editing and questions
+
+The local plugin in `lua/ivan/claude.lua` supports **OpenCode** (the default)
+and **Claude Code**. Install and authenticate the CLI you want to use.
+
+- `<leader>cb`: choose the backend (OpenCode or Claude).
+- `<leader>cm`: choose its model; OpenCode's `default` uses its configured model.
+- `<leader>cp`: prettify the selection or file.
+- `<leader>ce`: edit with an instruction.
+- `<leader>ca`: ask about the selection or file.
+- `<leader>cr` / `<leader>cf`: retry / refine or follow up.
+- `<leader>ct` / `<leader>cw`: toggle thinking / show returned reasoning.
+- `<leader>co`: reopen the last answer.
+
+Backend, per-backend models, and thinking are remembered across restarts.
+Both backends read project files for questions and edits; proposed edits are
+applied to Neovim buffers and remain unsaved. OpenCode's thinking toggle requests
+the `high` model variant when enabled; variant support depends on the model.
+
+The existing `require('ivan.claude').setup()` entry point still works. You can
+also configure it explicitly:
+
+```lua
+require('ivan.claude').setup { backend = 'opencode', model = 'openai/gpt-5.4' }
+```
+
+Explicit setup values override saved preferences on startup. Future CLI backends
+can be registered through `setup { backends = { name = adapter } }`. An adapter
+provides `label`, `default_model`, `models(callback)`,
+`prepare(handler, model, thinking, prompt)` (returning a command list and
+`vim.system` options), and `parse(result, handler)` (returning
+`{ text, structured, thoughts }` or `nil, error`). Structured edits contain
+`replacement` and `file_edits` entries with `path`, `find`, and `replace`.
+
 ## Introduction
 
 A starting point for Neovim that is:
@@ -238,4 +272,3 @@ sudo dnf install -y gcc make git ripgrep fd-find unzip neovim
 sudo pacman -S --noconfirm --needed gcc make git ripgrep fd unzip neovim
 ```
 </details>
-
