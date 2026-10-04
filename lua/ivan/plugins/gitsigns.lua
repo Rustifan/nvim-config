@@ -103,6 +103,10 @@ return {
           gitsigns.nav_hunk 'next'
         end, { desc = 'git [n]ext hunk' })
 
+        map('n', '<leader>hN', function()
+          gitsigns.nav_hunk('next', { target = 'staged' })
+        end, { desc = 'git [N]ext staged hunk' })
+
         -- Actions
         -- visual mode
         map('v', '<leader>hs', function()
