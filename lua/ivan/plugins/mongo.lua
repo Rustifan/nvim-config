@@ -8,11 +8,11 @@ return {
       local mongo_data_file = vim.fn.stdpath('data') .. '/mongo_databases.json'
 
       local mongo_databases = {
-        { label = 'local/kompare-platform', url = 'mongodb://localhost/kompare-platform' },
+        { label = 'local/example', url = 'mongodb://localhost/example' },
       }
       local mongo_current_db = 1 -- Index of currently selected database
 
-      -- urls are mongosh connection strings, so the scheme is optional: db4.kompare.pw/kompare is valid
+      -- urls are mongosh connection strings, so the scheme is optional: db.example.com/mydb is valid
       local function mongo_split_url(url)
         local scheme, rest = url:match '^([%w%+]+://)(.*)$'
         local body, query = (rest or url):match '^([^?]*)(%?.*)$'
@@ -256,21 +256,22 @@ return {
         return buf, win
       end
 
+      local function mongo_expression_collection(code)
+        local trimmed = code:gsub('^%s+', '')
+        return trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%s*%.")
+          or trimmed:match('^db%.([%w_%-]+)%s*%.')
+      end
+
       local function mongo_detect_find_operation(code)
         local trimmed = code:gsub('^%s+', ''):gsub('%s+$', '')
-        local collection = trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%s*%.findOne%s*%(")
-          or trimmed:match('^db%.([%w_%-]+)%s*%.findOne%s*%(')
-        if collection then
-          return { collection = collection, operation = 'findOne' }
-        end
+        local collection = mongo_expression_collection(trimmed)
+        if not collection then return nil end
 
-        collection = trimmed:match("^db%.getCollection%s*%(%s*['\"]([^'\"]+)['\"]%s*%)%s*%.find%s*%(")
-          or trimmed:match('^db%.([%w_%-]+)%s*%.find%s*%(')
-        if collection then
-          return { collection = collection, operation = 'find' }
-        end
+        local rest = trimmed:match('^db%.getCollection%s*%b()%s*(.*)$') or trimmed:match('^db%.[%w_%-]+%s*(.*)$')
+        local operation = rest and (rest:match('^%.(findOne)%s*%(') or rest:match('^%.(find)%s*%('))
+        if not operation then return nil end
 
-        return nil
+        return { collection = collection, operation = operation }
       end
 
       local function mongo_decoded_json_value(text)
@@ -779,15 +780,50 @@ return {
         end, { buffer = buf, desc = 'Confirm Mongo run' })
       end
 
-      local function mongo_run_job(db, code, on_exit, display_code)
+      local function mongo_plan_confirm(plan)
+        local buf, win = mongo_open_float(plan.lines, plan.title, 'text', {
+          modifiable = false,
+          zindex = mongo_confirm_zindex,
+          footer = plan.overwrites and ' <CR> confirm (asks for the target label) · q cancel ' or ' <CR> run · q cancel ',
+        })
+
+        local function cancel()
+          mongo_close_window(win)
+          vim.notify('Mongo ' .. plan.name .. ' cancelled', vim.log.levels.WARN)
+        end
+
+        vim.keymap.set('n', 'q', cancel, { buffer = buf, desc = 'Cancel Mongo ' .. plan.name })
+        vim.keymap.set('n', '<Esc>', cancel, { buffer = buf, desc = 'Cancel Mongo ' .. plan.name })
+        vim.keymap.set('n', '<CR>', function()
+          if plan.overwrites then
+            mongo_ask_database_name(plan.target, win, plan.run)
+            return
+          end
+
+          mongo_close_window(win)
+          plan.run()
+        end, { buffer = buf, desc = 'Confirm Mongo ' .. plan.name })
+      end
+
+      local function mongo_open_summary(lines, title, footer)
+        local buf, win = mongo_open_float(lines, title, 'text', {
+          modifiable = false,
+          footer = footer or ' q close ',
+        })
+        mongo_close_keymaps(buf, win, 'Close Mongo summary')
+        return buf, win
+      end
+
+      local function mongo_run_job(db, code, on_exit, opts)
+        local options = opts or {}
         if not mongo_is_protected(db) then
-          mongo_start_job(db, code, on_exit)
+          mongo_start_job(db, code, on_exit, options.env)
           return
         end
 
         mongo_confirm_run(db, code, function()
-          mongo_start_job(db, code, on_exit)
-        end, display_code)
+          mongo_start_job(db, code, on_exit, options.env)
+        end, options.display)
       end
 
       local function mongo_ejson_preview_script(collection, edited_text)
@@ -1026,7 +1062,7 @@ return {
             state.original_text = table.concat(result.lines, '\n')
           end
           vim.notify('Mongo result refreshed')
-        end, q.code)
+        end, { display = q.code })
       end
 
       local function mongo_open_output_float(db, exit_code, output, errors)
@@ -1149,24 +1185,46 @@ return {
           end
 
           mongo_open_results_index(db, code, results)
-        end, code)
+        end, { display = code })
       end
 
 
-      -- Collection copy: mongosh always connects to the target, the source is only ever read
-      local mongo_copy_marker = '__MONGO_COPY__'
+      -- scripts hand structured results back on a marker line, so stray mongosh output is ignored
+      local mongo_payload_marker = '__MONGO_PAYLOAD__'
+      local mongo_payload_end_marker = '__MONGO_PAYLOAD_END__'
 
-      local mongo_copy_modes = {
-        { key = 'replace', label = 'Replace — drop the target collection, then copy' },
+      local function mongo_marker_index(output, marker)
+        for index, line in ipairs(output) do
+          if line:sub(1, #marker) == marker then return index end
+        end
+        return nil
+      end
+
+      local function mongo_payload_decode(output)
+        local index = mongo_marker_index(output, mongo_payload_marker)
+        if not index then return nil end
+
+        local decoded = mongo_decoded_json_value(output[index]:sub(#mongo_payload_marker + 1))
+        if type(decoded) ~= 'table' then return nil end
+        return decoded
+      end
+
+      local mongo_write_modes = {
+        { key = 'replace', label = 'Replace — drop the target collection first' },
         { key = 'merge', label = 'Merge — upsert by _id, keep target-only documents' },
         { key = 'create', label = 'Create — abort if the target collection exists' },
       }
 
       -- the mongosh cli accepts a scheme-less connection string, but connect() inside a script folds
       -- the query string into the database name unless the uri is absolute
-      local function mongo_copy_source_uri(db)
+      local function mongo_absolute_uri(db)
         local url = mongo_active_url(db)
-        local absolute = mongo_split_url(url).scheme ~= '' and url or 'mongodb://' .. url
+        return mongo_split_url(url).scheme ~= '' and url or 'mongodb://' .. url
+      end
+
+      -- Collection copy: mongosh always connects to the target, the source is only ever read
+      local function mongo_copy_source_uri(db)
+        local absolute = mongo_absolute_uri(db)
         if absolute:match 'readPreference=' then return absolute end
         return absolute .. (absolute:find('?', 1, true) and '&' or '?') .. 'readPreference=secondaryPreferred'
       end
@@ -1183,7 +1241,7 @@ return {
       const __infos = db.getCollectionInfos({ name: __targetName });
       const __exists = __infos.length > 0;
 
-      print(']] .. mongo_copy_marker .. [[' + EJSON.stringify({
+      print(']] .. mongo_payload_marker .. [[' + EJSON.stringify({
         sourceCount: __source.estimatedDocumentCount(),
         sourceIndexes: __source.getIndexes().filter(index => index.name !== '_id_').length,
         targetExists: __exists,
@@ -1244,7 +1302,7 @@ return {
         }
       });
 
-      print(']] .. mongo_copy_marker .. [[' + EJSON.stringify({
+      print(']] .. mongo_payload_marker .. [[' + EJSON.stringify({
         copied: __written.copied,
         inserted: __written.inserted,
         replaced: __written.replaced,
@@ -1255,45 +1313,27 @@ return {
       ]]
       end
 
-      local function mongo_copy_payload(output)
-        for _, line in ipairs(output) do
-          if line:sub(1, #mongo_copy_marker) == mongo_copy_marker then
-            return line:sub(#mongo_copy_marker + 1)
-          end
-        end
-        return nil
-      end
-
-      local function mongo_copy_decode(output)
-        local payload = mongo_copy_payload(output)
-        if not payload then return nil end
-
-        local ok, decoded = pcall(vim.fn.json_decode, payload)
-        if not ok or type(decoded) ~= 'table' then return nil end
-        return decoded
-      end
-
-      local function mongo_copy_target_entry(target, database)
+      local function mongo_db_entry_with_database(target, database)
         return vim.tbl_extend('force', vim.deepcopy(target), { database = database })
       end
 
-      local function mongo_copy_endpoint(db, collection)
+      local function mongo_endpoint_label(db, collection)
         return db.label .. '  › ' .. (mongo_active_db(db) or '(no db)') .. '  › ' .. collection
       end
 
       local function mongo_copy_from_line(spec)
-        return 'FROM   ' .. mongo_copy_endpoint(spec.source, spec.source_collection)
+        return 'FROM   ' .. mongo_endpoint_label(spec.source, spec.source_collection)
       end
 
       local function mongo_copy_to_line(spec)
-        return 'TO     ' .. mongo_copy_endpoint(spec.target, spec.target_collection)
+        return 'TO     ' .. mongo_endpoint_label(spec.target, spec.target_collection)
       end
 
       -- the source connection string carries credentials, so it travels in the environment instead
       -- of the script file mongosh reads for anything past mongo_max_eval_length
       local function mongo_copy_job(spec, script, on_result)
         mongo_start_job(spec.target, script, function(exit_code, output, errors)
-          local decoded = exit_code == 0 and mongo_copy_decode(output) or nil
+          local decoded = exit_code == 0 and mongo_payload_decode(output) or nil
           if not decoded then
             mongo_open_output_float(spec.target, exit_code, output, errors)
             return
@@ -1302,15 +1342,15 @@ return {
         end, { MONGO_COPY_SOURCE_URI = mongo_copy_source_uri(spec.source) })
       end
 
-      local function mongo_copy_warning_lines(spec, stats)
+      local function mongo_overwrite_warning_lines(mode_key, stats)
         if not stats.targetExists or stats.targetCount == 0 then
           return { '', 'Target is empty — nothing will be overwritten.' }
         end
-        if spec.mode.key == 'replace' then
+        if mode_key == 'replace' then
           return {
             '',
             string.format('WARNING  the target already holds %s documents.', stats.targetCount),
-            'They will be DROPPED, together with their indexes, before the copy.',
+            'They will be DROPPED, together with their indexes, before the write.',
           }
         end
         return {
@@ -1329,7 +1369,7 @@ return {
           '',
           'MODE   ' .. spec.mode.label,
         }
-        return vim.list_extend(plan, mongo_copy_warning_lines(spec, stats))
+        return vim.list_extend(plan, mongo_overwrite_warning_lines(spec.mode.key, stats))
       end
 
       local function mongo_copy_result_lines(spec, result)
@@ -1346,48 +1386,25 @@ return {
         return vim.list_extend(vim.list_extend(lines, { '', 'index errors:' }), result.indexErrors)
       end
 
-      local function mongo_copy_open_result(spec, result)
-        local buf, win = mongo_open_float(mongo_copy_result_lines(spec, result), ' Mongo copy done ', 'text', {
-          modifiable = false,
-          footer = ' q close ',
-        })
-        mongo_close_keymaps(buf, win, 'Close Mongo copy result')
-      end
-
       local function mongo_copy_run(spec)
-        vim.notify('Copying ' .. spec.source_collection .. ' → ' .. mongo_copy_endpoint(spec.target, spec.target_collection))
+        vim.notify('Copying ' .. spec.source_collection .. ' → ' .. mongo_endpoint_label(spec.target, spec.target_collection))
         mongo_copy_job(spec, mongo_copy_script(spec), function(result)
-          mongo_copy_open_result(spec, result)
+          mongo_open_summary(mongo_copy_result_lines(spec, result), ' Mongo copy done ')
         end)
       end
 
       local function mongo_copy_confirm(spec, stats)
         local overwrites = stats.targetExists and stats.targetCount > 0
-        local title = overwrites and ' MONGO COPY — WILL OVERWRITE ' or ' Mongo copy '
-        local buf, win = mongo_open_float(mongo_copy_plan_lines(spec, stats), title, 'text', {
-          modifiable = false,
-          zindex = mongo_confirm_zindex,
-          footer = overwrites and ' <CR> confirm (asks for the target label) · q cancel ' or ' <CR> run copy · q cancel ',
+        mongo_plan_confirm({
+          lines = mongo_copy_plan_lines(spec, stats),
+          title = overwrites and ' MONGO COPY — WILL OVERWRITE ' or ' Mongo copy ',
+          name = 'copy',
+          target = spec.target,
+          overwrites = overwrites,
+          run = function()
+            mongo_copy_run(spec)
+          end,
         })
-
-        local function cancel()
-          mongo_close_window(win)
-          vim.notify('Mongo copy cancelled', vim.log.levels.WARN)
-        end
-
-        vim.keymap.set('n', 'q', cancel, { buffer = buf, desc = 'Cancel Mongo copy' })
-        vim.keymap.set('n', '<Esc>', cancel, { buffer = buf, desc = 'Cancel Mongo copy' })
-        vim.keymap.set('n', '<CR>', function()
-          if overwrites then
-            mongo_ask_database_name(spec.target, win, function()
-              mongo_copy_run(spec)
-            end)
-            return
-          end
-
-          mongo_close_window(win)
-          mongo_copy_run(spec)
-        end, { buffer = buf, desc = 'Confirm Mongo copy' })
       end
 
       local function mongo_copy_preflight(spec)
@@ -1410,8 +1427,13 @@ return {
       end
 
       local function mongo_copy_choose_mode(spec)
-        vim.ui.select(mongo_copy_modes, {
-          prompt = 'Copy into ' .. mongo_copy_endpoint(spec.target, spec.target_collection) .. ':',
+        if mongo_copy_same_namespace(spec) then
+          vim.notify('Source and target are the same collection', vim.log.levels.ERROR)
+          return
+        end
+
+        vim.ui.select(mongo_write_modes, {
+          prompt = 'Copy into ' .. mongo_endpoint_label(spec.target, spec.target_collection) .. ':',
           format_item = function(mode)
             return mode.label
           end,
@@ -1421,25 +1443,20 @@ return {
         end)
       end
 
-      local function mongo_copy_choose_target_collection(spec)
+      -- Target picking (connection › database › collection), shared by copy and export
+      local function mongo_target_choose_collection(target, default_collection, on_target)
         vim.ui.input({
-          prompt = 'Target collection on ' .. mongo_db_display(spec.target) .. ': ',
-          default = spec.source_collection,
+          prompt = 'Target collection on ' .. mongo_db_display(target) .. ': ',
+          default = default_collection,
         }, function(name)
           if not name or vim.trim(name) == '' then return end
-
-          local filled = vim.tbl_extend('force', spec, { target_collection = vim.trim(name) })
-          if mongo_copy_same_namespace(filled) then
-            vim.notify('Source and target are the same collection', vim.log.levels.ERROR)
-            return
-          end
-          mongo_copy_choose_mode(filled)
+          on_target(target, vim.trim(name))
         end)
       end
 
-      local mongo_copy_new_database = '+ new database…'
+      local mongo_new_database_item = '+ new database…'
 
-      local function mongo_copy_ordered_databases(target, names)
+      local function mongo_target_ordered_databases(target, names)
         local active = mongo_active_db(target)
         if not active or not vim.tbl_contains(names, active) then return names end
 
@@ -1449,51 +1466,47 @@ return {
         return vim.list_extend({ active }, rest)
       end
 
-      local function mongo_copy_database_items(target, names)
-        local ordered = mongo_copy_ordered_databases(target, names)
-        return vim.list_extend(vim.deepcopy(ordered), { mongo_copy_new_database })
+      local function mongo_target_database_items(target, names)
+        local ordered = mongo_target_ordered_databases(target, names)
+        return vim.list_extend(vim.deepcopy(ordered), { mongo_new_database_item })
       end
 
-      local function mongo_copy_choose_target_database(spec)
+      local function mongo_target_choose_database(target, default_collection, on_target)
         local function continue(name)
           if not name or vim.trim(name) == '' then return end
-          mongo_copy_choose_target_collection(vim.tbl_extend('force', spec, {
-            target = mongo_copy_target_entry(spec.target, vim.trim(name)),
-          }))
+          mongo_target_choose_collection(mongo_db_entry_with_database(target, vim.trim(name)), default_collection, on_target)
         end
 
         local function ask_new_database()
-          vim.ui.input({ prompt = 'New database on ' .. spec.target.label .. ': ' }, continue)
+          vim.ui.input({ prompt = 'New database on ' .. target.label .. ': ' }, continue)
         end
 
-        mongo_start_job(spec.target, mongo_list_databases_script, function(exit_code, output)
+        mongo_start_job(target, mongo_list_databases_script, function(exit_code, output)
           local names = mongo_parse_names(exit_code, output)
           if not names then
             ask_new_database()
             return
           end
 
-          vim.ui.select(mongo_copy_database_items(spec.target, names), {
-            prompt = 'Copy into which database on ' .. spec.target.label .. ':',
+          vim.ui.select(mongo_target_database_items(target, names), {
+            prompt = 'Write into which database on ' .. target.label .. ':',
           }, function(name)
-            if name == mongo_copy_new_database then return ask_new_database() end
+            if name == mongo_new_database_item then return ask_new_database() end
             continue(name)
           end)
         end)
       end
 
-      local function mongo_copy_choose_target(spec)
-        vim.ui.select(mongo_database_items(true), {
-          prompt = 'Copy ' .. spec.source_collection .. ' into which connection:',
-        }, function(_, idx)
+      local function mongo_choose_target(prompt, default_collection, on_target)
+        vim.ui.select(mongo_database_items(true), { prompt = prompt }, function(_, idx)
           if not idx then return end
 
           local target = mongo_databases[idx]
           if mongo_is_protected(target) then
-            vim.notify('Refusing to copy into a protected database: ' .. target.label, vim.log.levels.ERROR)
+            vim.notify('Refusing to write into a protected database: ' .. target.label, vim.log.levels.ERROR)
             return
           end
-          mongo_copy_choose_target_database(vim.tbl_extend('force', spec, { target = target }))
+          mongo_target_choose_database(target, default_collection, on_target)
         end)
       end
 
@@ -1507,7 +1520,15 @@ return {
 
           vim.ui.select(names, { prompt = 'Copy which collection from ' .. mongo_db_display(source) .. ':' }, function(name)
             if not name then return end
-            mongo_copy_choose_target({ source = source, source_collection = name })
+
+            mongo_choose_target('Copy ' .. name .. ' into which connection:', name, function(target, collection)
+              mongo_copy_choose_mode({
+                source = source,
+                source_collection = name,
+                target = target,
+                target_collection = collection,
+              })
+            end)
           end)
         end)
       end
@@ -1524,6 +1545,570 @@ return {
           mongo_copy_choose_source_collection(source)
         end)
       end, { desc = '[M]ongo [C]opy collection to another database' })
+
+      -- Export: run a query and write its documents to a CSV file or another collection
+      local function mongo_export_sources(code)
+        local statements = mongo_split_statements(code)
+        local sources = {}
+
+        for index, text in ipairs(statements) do
+          local body = mongo_strip_leading_trivia(text)
+          if mongo_is_expression(body) then
+            local preamble = table.concat(vim.list_slice(statements, 1, index - 1), '\n')
+            local expression = (body:gsub('%s*;%s*$', ''))
+            table.insert(sources, {
+              expression = expression,
+              preamble = preamble,
+              display = preamble == '' and expression or preamble .. '\n' .. expression,
+            })
+          end
+        end
+
+        return sources
+      end
+
+      local function mongo_export_docs_script(source)
+        return source.preamble .. [==[
+
+      const __exportValue = (
+      ]==] .. source.expression .. [==[
+
+      );
+      const __exportResolved = __exportValue && typeof __exportValue.toArray === 'function' ? __exportValue.toArray() : __exportValue;
+      const __exportDocs = Array.isArray(__exportResolved) ? __exportResolved : (__exportResolved === null || __exportResolved === undefined ? [] : [__exportResolved]);
+      ]==]
+      end
+
+      local function mongo_export_rows_script(source)
+        return mongo_export_docs_script(source) .. [==[
+      const __isPlainObject = value => value && typeof value === 'object' && !Array.isArray(value) && !value._bsontype && !(value instanceof Date);
+      const __cell = value => {
+        if (value === null || value === undefined) return '';
+        if (value._bsontype === 'ObjectId') return value.toHexString();
+        if (value instanceof Date) return value.toISOString();
+        if (value._bsontype) return value.toString();
+        if (typeof value === 'object') return EJSON.stringify(value);
+        if (typeof value === 'number' || typeof value === 'boolean') return value;
+        return String(value);
+      };
+      const __flatten = (value, prefix) => {
+        if (__isPlainObject(value)) {
+          const entries = Object.entries(value);
+          if (entries.length === 0) return [[prefix, '{}']];
+
+          return entries.flatMap(([key, item]) => __flatten(item, prefix ? `${prefix}.${key}` : key));
+        }
+        if (Array.isArray(value)) {
+          if (value.length === 0) return [[prefix, '[]']];
+
+          return value.flatMap((item, index) => __flatten(item, prefix ? `${prefix}.${index}` : String(index)));
+        }
+
+        return [[prefix || 'value', __cell(value)]];
+      };
+      const __rows = __exportDocs.map(doc => new Map(__flatten(doc, '')));
+      const __columns = [...__rows.reduce((columns, row) => [...row.keys()].reduce((all, key) => all.add(key), columns), new Set())];
+      const __cellsOf = row => __columns.map(column => row.get(column) ?? '');
+
+      print(']==] .. mongo_payload_marker .. [==[' + EJSON.stringify({ rows: __rows.length, columns: __columns.length }));
+      ]==]
+      end
+
+      -- both file formats are printed between markers instead of written by mongosh, so the path
+      -- stays a vim path and no temp file has to travel between the two processes
+      local function mongo_export_csv_script(source)
+        return mongo_export_rows_script(source) .. [==[
+      const __escape = text => /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+      const __line = cells => cells.map(cell => __escape(String(cell))).join(',');
+
+      print([__line(__columns), ...__rows.map(row => __line(__cellsOf(row)))].join('\n'));
+      print(']==] .. mongo_payload_end_marker .. [==[');
+      ]==]
+      end
+
+      -- one JSON array per line: rows survive embedded newlines and cells keep their JSON type
+      local function mongo_export_sheet_script(source)
+        return mongo_export_rows_script(source) .. [==[
+      print([JSON.stringify(__columns), ...__rows.map(row => JSON.stringify(__cellsOf(row)))].join('\n'));
+      print(']==] .. mongo_payload_end_marker .. [==[');
+      ]==]
+      end
+
+      -- the query runs on the source connection, so `db` still means what the query was written for
+      local function mongo_export_collection_script(source, spec)
+        return mongo_export_docs_script(source) .. [==[
+      const __targetName = ]==] .. vim.fn.json_encode(spec.collection) .. [==[;
+      const __mode = ]==] .. vim.fn.json_encode(spec.mode.key) .. [==[;
+      const __targetDb = connect(process.env.MONGO_EXPORT_TARGET_URI);
+      const __existing = __targetDb.getCollectionInfos({ name: __targetName });
+
+      if (__mode === 'create' && __existing.length > 0) {
+        throw new Error(`Target collection ${__targetName} already exists`);
+      }
+
+      const __dropped = __mode === 'replace' && __existing.length > 0 && __exportDocs.length > 0;
+      if (__dropped) {
+        __targetDb.getCollection(__targetName).drop();
+      }
+
+      const __target = __targetDb.getCollection(__targetName);
+      const __operation = doc => __mode === 'merge' && doc._id !== undefined
+        ? { replaceOne: { filter: { _id: doc._id }, replacement: doc, upsert: true } }
+        : { insertOne: { document: doc } };
+      const __batches = Array.from(
+        { length: Math.ceil(__exportDocs.length / 500) },
+        (unused, index) => __exportDocs.slice(index * 500, index * 500 + 500)
+      );
+      const __written = __batches.reduce((totals, batch) => {
+        const result = __target.bulkWrite(batch.map(__operation), { ordered: false });
+        return {
+          inserted: totals.inserted + result.insertedCount + result.upsertedCount,
+          replaced: totals.replaced + result.modifiedCount,
+        };
+      }, { inserted: 0, replaced: 0 });
+
+      print(']==] .. mongo_payload_marker .. [==[' + EJSON.stringify({
+        exported: __exportDocs.length,
+        inserted: __written.inserted,
+        replaced: __written.replaced,
+        dropped: __dropped,
+        targetCount: __target.countDocuments({}),
+      }));
+      ]==]
+      end
+
+      local function mongo_target_stats_script(collection)
+        return [==[
+      const __name = ]==] .. vim.fn.json_encode(collection) .. [==[;
+      const __infos = db.getCollectionInfos({ name: __name });
+
+      print(']==] .. mongo_payload_marker .. [==[' + EJSON.stringify({
+        targetExists: __infos.length > 0,
+        targetType: __infos.length > 0 ? __infos[0].type : '',
+        targetCount: __infos.length > 0 ? db.getCollection(__name).estimatedDocumentCount() : 0,
+      }));
+      ]==]
+      end
+
+      local function mongo_export_query_line(db, source)
+        return 'QUERY  ' .. mongo_endpoint_label(db, mongo_result_label(source.expression))
+      end
+
+      local function mongo_export_payload_lines(output)
+        local first = mongo_marker_index(output, mongo_payload_marker)
+        local last = mongo_marker_index(output, mongo_payload_end_marker)
+        if not first or not last then return nil end
+        return vim.list_slice(output, first + 1, last - 1)
+      end
+
+      -- xlsx is a zip of a handful of XML parts, so the system zip is the only thing this needs
+      local function mongo_xlsx_column_ref(index)
+        if index <= 0 then return '' end
+
+        local rest = (index - 1) % 26
+        return mongo_xlsx_column_ref(math.floor((index - 1 - rest) / 26)) .. string.char(65 + rest)
+      end
+
+      -- line breaks become character references because writefile() turns a newline inside a list
+      -- item into a NUL byte, and control characters other than tab are illegal in XML 1.0 anyway
+      local function mongo_xml_escape(text)
+        local escaped = text:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')
+        return (escaped:gsub('\r?\n', '&#10;'):gsub('\r', '&#10;'):gsub('[%z\1-\8\11\12\14-\31]', ''))
+      end
+
+      local function mongo_xlsx_number(value)
+        if value % 1 == 0 and math.abs(value) < 2 ^ 53 then return string.format('%d', value) end
+        return string.format('%.15g', value)
+      end
+
+      local function mongo_xlsx_cell(column, row, value)
+        local ref = mongo_xlsx_column_ref(column) .. row
+        if type(value) == 'number' then
+          return '<c r="' .. ref .. '"><v>' .. mongo_xlsx_number(value) .. '</v></c>'
+        end
+        if type(value) == 'boolean' then
+          return '<c r="' .. ref .. '" t="b"><v>' .. (value and '1' or '0') .. '</v></c>'
+        end
+        if type(value) ~= 'string' or value == '' then return '' end
+
+        return '<c r="' .. ref .. '" t="inlineStr"><is><t xml:space="preserve">' .. mongo_xml_escape(value) .. '</t></is></c>'
+      end
+
+      local function mongo_xlsx_row(cells, row)
+        local rendered = vim.tbl_map(function(column)
+          return mongo_xlsx_cell(column, row, cells[column])
+        end, vim.fn.range(1, #cells))
+        return '<row r="' .. row .. '">' .. table.concat(rendered) .. '</row>'
+      end
+
+      local mongo_xlsx_sheet_ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+
+      local function mongo_xlsx_sheet_lines(columns, rows)
+        local last = mongo_xlsx_column_ref(#columns) .. tostring(#rows + 1)
+        local head = {
+          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<worksheet xmlns="' .. mongo_xlsx_sheet_ns .. '">',
+          '<dimension ref="A1:' .. last .. '"/>',
+          '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>',
+          '<sheetData>',
+          mongo_xlsx_row(columns, 1),
+        }
+
+        for index, cells in ipairs(rows) do
+          table.insert(head, mongo_xlsx_row(cells, index + 1))
+        end
+
+        return vim.list_extend(head, { '</sheetData>', '<autoFilter ref="A1:' .. last .. '"/>', '</worksheet>' })
+      end
+
+      local mongo_xlsx_parts = {
+        ['[Content_Types].xml'] = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          .. '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          .. '<Default Extension="xml" ContentType="application/xml"/>'
+          .. '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+          .. '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+        ['_rels/.rels'] = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+          .. '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        ['xl/workbook.xml'] = '<workbook xmlns="' .. mongo_xlsx_sheet_ns .. '" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+          .. '<sheets><sheet name="export" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        ['xl/_rels/workbook.xml.rels'] = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+          .. '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+      }
+
+      local function mongo_xlsx_write_part(directory, name, lines)
+        local part = directory .. '/' .. name
+        vim.fn.mkdir(vim.fn.fnamemodify(part, ':h'), 'p')
+        return vim.fn.writefile(lines, part) == 0
+      end
+
+      local function mongo_xlsx_write_parts(directory, sheet_lines)
+        local written = vim.tbl_map(function(name)
+          return mongo_xlsx_write_part(directory, name, {
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            mongo_xlsx_parts[name],
+          })
+        end, vim.tbl_keys(mongo_xlsx_parts))
+
+        table.insert(written, mongo_xlsx_write_part(directory, 'xl/worksheets/sheet1.xml', sheet_lines))
+        return not vim.tbl_contains(written, false)
+      end
+
+      -- zip updates an existing archive in place, so the target has to go first
+      local function mongo_xlsx_zip(directory, path, on_done)
+        vim.fn.delete(path)
+
+        local started, job = pcall(vim.fn.jobstart, { 'zip', '-X', '-q', '-r', path, '.' }, {
+          cwd = directory,
+          on_exit = function(_, exit_code)
+            vim.schedule(function()
+              vim.fn.delete(directory, 'rf')
+              on_done(exit_code == 0)
+            end)
+          end,
+        })
+
+        if not started or job <= 0 then
+          vim.fn.delete(directory, 'rf')
+          on_done(false)
+        end
+      end
+
+      local function mongo_export_write_csv(path, lines, on_done)
+        local written, code = pcall(vim.fn.writefile, lines, path)
+        on_done(written and code == 0)
+      end
+
+      local function mongo_export_write_xlsx(path, lines, on_done)
+        local decoded = vim.tbl_map(function(line)
+          local value = mongo_decoded_json_value(line)
+          return type(value) == 'table' and value or false
+        end, lines)
+
+        if #decoded == 0 or vim.tbl_contains(decoded, false) then
+          on_done(false)
+          return
+        end
+
+        local directory = vim.fn.tempname()
+        local sheet = mongo_xlsx_sheet_lines(decoded[1], vim.list_slice(decoded, 2, #decoded))
+        if not mongo_xlsx_write_parts(directory, sheet) then
+          vim.fn.delete(directory, 'rf')
+          on_done(false)
+          return
+        end
+
+        mongo_xlsx_zip(directory, path, on_done)
+      end
+
+      local mongo_export_file_kinds = {
+        csv = {
+          label = 'CSV',
+          extension = '.csv',
+          title = ' Mongo CSV export done ',
+          footer = ' <CR> open file · q close ',
+          note = 'nested fields are flattened into dot-notation columns',
+          script = function(source) return mongo_export_csv_script(source) end,
+          write = function(path, lines, on_done) mongo_export_write_csv(path, lines, on_done) end,
+          open = function(path) vim.cmd.edit(path) end,
+        },
+        xlsx = {
+          label = 'Excel file',
+          extension = '.xlsx',
+          title = ' Mongo Excel export done ',
+          footer = ' <CR> open in Excel · q close ',
+          note = 'numbers stay numeric · header row frozen with an autofilter',
+          script = function(source) return mongo_export_sheet_script(source) end,
+          write = function(path, lines, on_done) mongo_export_write_xlsx(path, lines, on_done) end,
+          open = function(path) vim.ui.open(path) end,
+        },
+      }
+
+      local function mongo_export_file_summary(db, source, path, stats, kind)
+        local buf, win = mongo_open_summary({
+          mongo_export_query_line(db, source),
+          'FILE   ' .. path,
+          '',
+          string.format('exported %s documents · %s columns', stats.rows, stats.columns),
+          kind.note,
+        }, kind.title, kind.footer)
+
+        vim.keymap.set('n', '<CR>', function()
+          mongo_close_window(win)
+          kind.open(path)
+        end, { buffer = buf, desc = 'Open exported ' .. kind.label })
+      end
+
+      local function mongo_export_run_file(db, source, path, kind)
+        vim.notify('Exporting → ' .. path)
+        mongo_run_job(db, kind.script(source), function(exit_code, output, errors)
+          local stats = exit_code == 0 and mongo_payload_decode(output) or nil
+          local lines = stats and mongo_export_payload_lines(output) or nil
+          if not lines then
+            mongo_open_output_float(db, exit_code, output, errors)
+            return
+          end
+          if stats.rows == 0 then
+            vim.notify('The query returned no documents — nothing was exported', vim.log.levels.WARN)
+            return
+          end
+
+          pcall(vim.fn.mkdir, vim.fn.fnamemodify(path, ':h'), 'p')
+          kind.write(path, lines, function(written)
+            if not written then
+              vim.notify('Could not write ' .. path, vim.log.levels.ERROR)
+              return
+            end
+            mongo_export_file_summary(db, source, path, stats, kind)
+          end)
+        end, { display = source.display })
+      end
+
+      local function mongo_export_choose_file_path(db, source, kind)
+        local default = vim.fn.getcwd() .. '/' .. (mongo_expression_collection(source.expression) or 'mongo-export') .. kind.extension
+        vim.ui.input({ prompt = 'Export ' .. kind.label .. ' to: ', default = default, completion = 'file' }, function(input)
+          if not input or vim.trim(input) == '' then return end
+
+          local path = vim.fn.fnamemodify(vim.trim(input), ':p')
+          if vim.fn.filereadable(path) == 0 then
+            mongo_export_run_file(db, source, path, kind)
+            return
+          end
+
+          vim.ui.select({ 'Overwrite', 'Cancel' }, { prompt = path .. ' already exists:' }, function(_, choice)
+            if choice ~= 1 then return end
+            mongo_export_run_file(db, source, path, kind)
+          end)
+        end)
+      end
+
+      local function mongo_export_result_lines(db, source, spec, result)
+        local lines = {
+          mongo_export_query_line(db, source),
+          'TO     ' .. mongo_endpoint_label(spec.target, spec.collection),
+          '',
+          string.format('exported %s documents (%s inserted · %s replaced)', result.exported, result.inserted, result.replaced),
+          string.format('target now holds %s documents', result.targetCount),
+        }
+        if result.exported > 0 then return lines end
+
+        return vim.list_extend(lines, { '', 'the query returned no documents — the target was left untouched' })
+      end
+
+      local function mongo_export_run_collection(db, source, spec)
+        vim.notify('Exporting → ' .. mongo_endpoint_label(spec.target, spec.collection))
+        mongo_run_job(db, mongo_export_collection_script(source, spec), function(exit_code, output, errors)
+          local result = exit_code == 0 and mongo_payload_decode(output) or nil
+          if not result then
+            mongo_open_output_float(db, exit_code, output, errors)
+            return
+          end
+
+          mongo_open_summary(mongo_export_result_lines(db, source, spec, result), ' Mongo export done ')
+        end, {
+          display = source.display,
+          env = { MONGO_EXPORT_TARGET_URI = mongo_absolute_uri(spec.target) },
+        })
+      end
+
+      local function mongo_export_plan_lines(db, source, spec, stats)
+        local plan = {
+          mongo_export_query_line(db, source),
+          '',
+          'TO     ' .. mongo_endpoint_label(spec.target, spec.collection),
+          '',
+          'MODE   ' .. spec.mode.label,
+        }
+        return vim.list_extend(plan, mongo_overwrite_warning_lines(spec.mode.key, stats))
+      end
+
+      local function mongo_export_confirm(db, source, spec, stats)
+        local overwrites = stats.targetExists and stats.targetCount > 0
+        mongo_plan_confirm({
+          lines = mongo_export_plan_lines(db, source, spec, stats),
+          title = overwrites and ' MONGO EXPORT — WILL OVERWRITE ' or ' Mongo export ',
+          name = 'export',
+          target = spec.target,
+          overwrites = overwrites,
+          run = function()
+            mongo_export_run_collection(db, source, spec)
+          end,
+        })
+      end
+
+      local function mongo_export_preflight(db, source, spec)
+        mongo_start_job(spec.target, mongo_target_stats_script(spec.collection), function(exit_code, output, errors)
+          local stats = exit_code == 0 and mongo_payload_decode(output) or nil
+          if not stats then
+            mongo_open_output_float(spec.target, exit_code, output, errors)
+            return
+          end
+          if stats.targetType == 'view' then
+            vim.notify('Target ' .. spec.collection .. ' is a view, not a collection', vim.log.levels.ERROR)
+            return
+          end
+          if stats.targetExists and spec.mode.key == 'create' then
+            vim.notify('Target collection already exists — pick Replace or Merge', vim.log.levels.WARN)
+            return
+          end
+
+          mongo_export_confirm(db, source, spec, stats)
+        end)
+      end
+
+      local function mongo_export_choose_mode(db, source, spec)
+        vim.ui.select(mongo_write_modes, {
+          prompt = 'Export into ' .. mongo_endpoint_label(spec.target, spec.collection) .. ':',
+          format_item = function(mode)
+            return mode.label
+          end,
+        }, function(mode)
+          if not mode then return end
+          mongo_export_preflight(db, source, vim.tbl_extend('force', spec, { mode = mode }))
+        end)
+      end
+
+      local mongo_export_destinations = {
+        { key = 'csv', label = 'CSV file — one flat row per document, dot-notation columns' },
+        { key = 'xlsx', label = 'Excel file — the same columns, with typed cells and a frozen header' },
+        { key = 'collection', label = 'Collection — write the documents into another collection' },
+      }
+
+      -- the workbook is zipped by the system zip, so it is only offered when that exists
+      local function mongo_export_destination_items()
+        if vim.fn.executable 'zip' == 1 then return mongo_export_destinations end
+
+        return vim.tbl_filter(function(destination)
+          return destination.key ~= 'xlsx'
+        end, mongo_export_destinations)
+      end
+
+      local function mongo_export_choose_destination(db, source)
+        vim.ui.select(mongo_export_destination_items(), {
+          prompt = 'Export ' .. mongo_result_label(source.expression) .. ' to:',
+          format_item = function(destination)
+            return destination.label
+          end,
+        }, function(destination)
+          if not destination then return end
+          local kind = mongo_export_file_kinds[destination.key]
+          if kind then
+            mongo_export_choose_file_path(db, source, kind)
+            return
+          end
+
+          mongo_choose_target('Export into which connection:', mongo_expression_collection(source.expression), function(target, collection)
+            mongo_export_choose_mode(db, source, { target = target, collection = collection })
+          end)
+        end)
+      end
+
+      local function mongo_export_start(code)
+        mongo_with_current_db(function(db)
+          if not mongo_active_db(db) then
+            mongo_pick_db(db, function()
+              mongo_export_start(code)
+            end)
+            return
+          end
+
+          local sources = mongo_export_sources(code)
+          if #sources == 0 then
+            vim.notify('No query to export here', vim.log.levels.WARN)
+            return
+          end
+          if #sources == 1 then
+            mongo_export_choose_destination(db, sources[1])
+            return
+          end
+
+          vim.ui.select(sources, {
+            prompt = 'Export which query:',
+            format_item = function(source)
+              return mongo_result_label(source.expression)
+            end,
+          }, function(source)
+            if not source then return end
+            mongo_export_choose_destination(db, source)
+          end)
+        end)
+      end
+
+      -- a result window knows the query behind it, so exporting from one skips picking it again
+      local function mongo_export_result(query)
+        local source = mongo_export_sources(query.code)[query.section]
+        if not source then
+          vim.notify('Could not find the query behind this result', vim.log.levels.WARN)
+          return
+        end
+
+        mongo_export_choose_destination(query.db, source)
+      end
+
+      local function mongo_buffer_code(buf)
+        local file = vim.fn.expand '%:p'
+        if vim.bo[buf].buftype ~= '' or vim.fn.filereadable(file) == 0 then
+          return mongo_buffer_text(buf)
+        end
+        return table.concat(vim.fn.readfile(file), '\n')
+      end
+
+      -- Export the results of a query to a CSV file or another collection
+      vim.keymap.set('n', '<leader>mx', function()
+        local buf = vim.api.nvim_get_current_buf()
+        local query = mongo_result_queries[buf]
+        if query then
+          mongo_export_result(query)
+          return
+        end
+
+        mongo_export_start(mongo_buffer_code(buf))
+      end, { desc = '[M]ongo e[X]port query results' })
+
+      vim.keymap.set('v', '<leader>mx', function()
+        vim.cmd 'normal! "vy'
+        mongo_export_start(vim.fn.getreg 'v')
+      end, { desc = '[M]ongo e[X]port selection results' })
+
       -- Normal mode: run current file
       vim.keymap.set('n', '<leader>me', function()
         local buf = vim.api.nvim_get_current_buf()
@@ -1810,21 +2395,21 @@ return {
 
       local mongo_links_seed_lines = {
         '{',
-        '  "KompareOffer": [',
+        '  "Order": [',
         '    {',
-        '      "db": "local/kompare-platform",',
+        '      "db": "local/example",',
         '      "links": [',
-        '        { "label": "New KPAS", "path": "http://kp.loc:3003/kompare-offer/<id>" },',
-        '        { "label": "Old KPAS", "path": "http://kp.loc/administracija/kpas/osiguranje-auto-ponude/<id>/" }',
+        '        { "label": "Admin", "path": "http://app.localhost:3000/orders/<id>" },',
+        '        { "label": "Legacy", "path": "http://legacy.localhost/orders/<id>/" }',
         '      ]',
         '    }',
         '  ],',
-        '  "SellingOpportunity": [',
+        '  "Customer": [',
         '    {',
-        '      "db": "local/kompare-platform",',
+        '      "db": "local/example",',
         '      "links": [',
-        '        { "label": "New KPAS", "path": "http://kp.loc:3003/selling-opportunity/<id>" },',
-        '        { "label": "Old KPAS", "path": "http://kp.loc/administracija/kpas/osiguranje-auto-prodajne-prilike/<id>/" }',
+        '        { "label": "Admin", "path": "http://app.localhost:3000/customers/<id>" },',
+        '        { "label": "Legacy", "path": "http://legacy.localhost/customers/<id>/" }',
         '      ]',
         '    }',
         '  ]',
