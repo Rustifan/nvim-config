@@ -1,5 +1,165 @@
 # kickstart.nvim
 
+## Execute code from the buffer
+
+TypeScript, JavaScript, and Go can be executed directly, including unsaved changes:
+
+| Key / command | Action |
+| --- | --- |
+| **`<leader>e`** in Normal mode | Execute the entire buffer |
+| **`<leader>e`** in Visual mode | Execute only the selection (line, character, or block) |
+| `:CodeRun` | Execute the entire buffer |
+| `:10,20CodeRun` | Execute a line range |
+| `:CodeRunSelection` | Execute the last Visual selection |
+| `:CodeRunStop` | Stop the running process |
+| `:CodeRunOutput` | Reopen/focus the last output |
+
+The leader is **Space**. Output streams into a reusable bottom split while focus
+stays on your code. In the output, **`q` / Esc** closes the split and **Ctrl-C**
+stops execution. Closing the output lets the process continue; its output is
+retained. Starting another run stops the previous one. The header shows the
+runtime, exit status, source lines, and working directory. Stderr is marked with
+`[stderr]`.
+
+For example, put this in a `.ts` buffer and press **Space e**:
+
+```ts
+function bla(a: string) {
+  console.log(a)
+}
+bla("asd")
+```
+
+### JavaScript/TypeScript runtime and imports
+
+- An installed **project-local `tsx`** is preferred, searching upward from the
+  source directory (including workspace-level installs), then `tsx` on PATH.
+  It supports JSX/TSX, extensionless imports, and tsconfig path aliases.
+  Install it in a project with `npm install --save-dev tsx` when needed.
+- Otherwise, **Node.js 22.7+** executes JS and TS directly; a current Node LTS
+  release is recommended. TypeScript uses `--experimental-transform-types` for
+  annotations, enums, and parameter properties. Node does not read `tsconfig.json`,
+  support JSX/TSX, or transform decorators. Native ESM relative imports must have
+  extensions, e.g. `import { helper } from './helper.ts'`.
+- Neither runtime type-checks the code. These are fresh script executions: use
+  `console.log`, `console.dir`, etc. to display values. Variables do not persist
+  between runs; a selection must include the imports and definitions it needs.
+
+JS/TS code is copied to a unique temporary sibling of the source file, retaining its
+extension (`.ts`, `.mts`, `.cts`, `.js`, `.mjs`, `.cjs`, `.tsx`, or `.jsx`). This
+keeps relative imports, package module settings, and ancestor `node_modules`
+resolution working. The working directory is the nearest package root, then the
+Git root, then the source directory. Unnamed scratch buffers use Neovim's current
+directory; set `:setfiletype typescript` or `javascript` first.
+
+The original file is never saved by the runner. Temporary files are removed on
+completion, stop, startup failure, and Neovim exit. The source directory must be
+writable. Selected code is padded with blank lines to preserve source line
+numbers; paths in stack traces are displayed as the original source path.
+Only the executed buffer/selection uses unsaved content; imported files are read
+from disk. File-identity APIs such as `import.meta.url` and `__filename` refer to
+the temporary sibling during execution.
+
+The previous diagnostic shortcut is now **`<leader>de`**.
+
+### Go buffers and snippets
+
+The same **Space e** shortcut runs Go using the installed `go` CLI:
+
+- A complete buffer with `package main` and `func main()` runs as a standalone
+  program, including unsaved changes.
+- Selected statements, or a scratch buffer without a `package` clause, are
+  wrapped in `func main()` automatically. Functions and imports stay at package
+  scope, along with type and `var`/`const` declarations in snippets that define
+  functions. Ordinary statement-only snippets keep their declarations local.
+  For example, this also works:
+
+  ```go
+  func bla(a string) {
+      fmt.Println(a)
+  }
+  bla("asd")
+  ```
+
+- Snippets reuse relevant imports from the source buffer. `fmt` is available
+  automatically when used. If **`goimports`** is installed, the runner also infers
+  other missing imports and removes unused imports for snippets. It is optional;
+  install it with `go install golang.org/x/tools/cmd/goimports@latest` if needed.
+- The working directory is the nearest **`go.mod`** root, then a **`go.work`**
+  root, then the source directory. The Go CLI uses the project's module,
+  workspace, dependency, vendor, and toolchain settings normally.
+
+For a quick check, select `fmt.Println("hello")` and press **Space e**. An unnamed
+scratch buffer also works after `:setfiletype go`.
+
+Each run uses a hidden temporary subdirectory beside the source, containing an
+isolated `main.go`. This lets a snippet import the source's package without
+mixing generated `package main` files into it. The directory is cleaned up on
+completion, stop, startup failure, and Neovim exit. Compiler errors and panic
+traces retain source file/line locations through Go line directives.
+
+Selections are fresh standalone programs: include the definitions or local
+variables you need, or import their package. Imported files are read from disk.
+For a whole library buffer that is not a runnable `package main`, select a snippet
+to test or write a `main` program that imports it. The Go helper's own compilation
+and snippet compilation both happen asynchronously; the first run may take longer
+while Go warms its build cache.
+
+### Configuration and additional languages
+
+The implementation lives in `lua/ivan/code_runner.lua`, with separate adapters in
+`lua/ivan/runners/node.lua` and `lua/ivan/runners/go.lua`. Change its existing setup
+call in `lua/ivan/init.lua` to configure it:
+
+```lua
+require('ivan.code_runner').setup {
+  key = '<leader>e', -- false disables the execution mappings; commands still work.
+  height = 12,
+  node = {
+    executable = 'node',
+    args = {}, -- Additional native Node arguments.
+    tsx = true, -- false always uses native Node.
+  },
+  go = {
+    executable = 'go',
+    args = {}, -- Additional go run flags, e.g. { '-race' }.
+    goimports = 'goimports', -- false disables optional import inference.
+  },
+}
+```
+
+Runners are registered by Neovim filetype, so Rust, Python, Bash, and others
+can be added independently of the selection, output, and process-management UI.
+Use `setup { runners = { filetype = adapter } }` or `register_runner(filetype, adapter)`.
+For example, this adds Bash execution:
+
+```lua
+require('ivan.code_runner').register_runner('sh', {
+  prepare = function(context)
+    return { cmd = { 'bash' }, stdin = context.code, label = 'Bash' }
+  end,
+})
+```
+
+`prepare(context)` returns a process plan or `nil, error`. Context includes
+`bufnr`, `filetype`, `path` (nil for unnamed buffers), `directory`, `cwd`, `code`,
+`first_line`, and `last_line`. Plans provide `cmd` (an argv list), with optional
+`cwd`, `env`, `stdin`, `label`, `path` (a temporary path to remap in output), and
+`cleanup()` (called once). Processes run asynchronously with stdin closed after
+any supplied input. File-based adapters can use
+`require('ivan.utils.code_execution').tempfile(context, extension, prefix)`;
+it returns `path, cleanup` or `nil, error`.
+
+Run the headless integration checks with:
+
+```sh
+nvim --headless -u NONE -l tests/code_runner.lua
+nvim --headless -u NONE -l tests/go_runner.lua
+```
+
+Set `NVIM_CODE_RUNNER_TSX` to an installed `tsx` executable to also check its
+project-local lookup, path aliases, and JSX support.
+
 ## AI editing and questions
 
 The local plugin in `lua/ivan/claude.lua` supports **OpenCode** (the default)
