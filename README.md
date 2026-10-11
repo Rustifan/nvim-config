@@ -10,6 +10,7 @@ and **Claude Code**. Install and authenticate the CLI you want to use.
 - `<leader>cp`: prettify the selection or file.
 - `<leader>ce`: edit with an instruction.
 - `<leader>ca`: ask about the selection or file.
+- `H`: get a short AI explanation of the symbol under the cursor.
 - `<leader>cr` / `<leader>cf`: retry / refine or follow up.
 - `<leader>ct` / `<leader>cw`: toggle thinking / show returned reasoning.
 - `<leader>co`: reopen the last answer.
@@ -19,12 +20,86 @@ Both backends read project files for questions and edits; proposed edits are
 applied to Neovim buffers and remain unsaved. OpenCode's thinking toggle requests
 the `high` model variant when enabled; variant support depends on the model.
 
+### AI hover
+
+Place the cursor on a function, variable, type, or other symbol and press `H`.
+It uses the backend, model, and thinking setting selected with `<leader>cb`,
+`<leader>cm`, and `<leader>ct`. The prompt includes the LSP hover documentation
+and the current buffer, including unsaved changes. The model can search and read
+other project files when needed. It also works without an LSP server.
+
+The result is requested as 2–3 short sentences (at most 60 words) and appears in
+a small Markdown window next to the cursor. Press `H` again to focus it; `q` or
+`Esc` closes it. Moving the cursor or entering Insert mode dismisses it.
+
+Inside the focused hover, press **`<leader>cf`** to ask another question about
+the symbol, or **Enter** when the cursor is not on a code reference.
+Follow-ups include the original LSP/file context,
+the summary, and all earlier questions and answers. Answers stay in the same
+window, where you can scroll and keep asking questions. The initial summary
+stays short; follow-ups can provide more detail or code examples when requested.
+Each question uses the currently selected backend/model. Cached hovers remember
+their conversations, so reopening one lets you continue where you left off.
+
+Summaries are cached in memory for the current Neovim session (up to 128 entries).
+Repeated requests while a summary is being generated share the same request.
+Cache entries are tied to the symbol location, backend/model/thinking settings,
+and project buffer versions; editing a loaded project buffer or saving a project
+file invalidates the relevant context. Use `:AIHover!` to regenerate after
+external file changes, or `:AIHoverClearCache` to clear all summaries. `:AIHover`
+also works as an alternative to the shortcut.
+
+### Navigable AI code references
+
+In a focused AI hover or full AI answer:
+
+- **Tab / Shift-Tab** moves to the next / previous reference, wrapping around.
+- **Enter** on an underlined reference closes the answer window and jumps to
+  the actual source location in the window you asked from, including other files.
+  Brackets, backticks, and the link destination also accept Enter. In a full AI
+  answer, Enter anywhere on a line with exactly one reference opens that reference.
+- **`<leader>cf`** asks a follow-up while you are reading either answer window.
+- After jumping, **`]l` / `[l`** walks through the answer's source location list.
+
+The model is asked to link verified symbols and code snippets as
+``[`functionName`](src/file.go:42)``. File-only links and plain file paths also
+work; without a line number they open at the beginning of the file. Citations
+support `path:line[:column]`, line ranges, `#L42` anchors, named line references,
+paths with spaces, local `file://` links, and reference-style Markdown links.
+Paths are checked relative to the project and the source file; abbreviated paths
+can be resolved through a background project-file lookup when the match is unique.
+Plain backtick-formatted symbols and function calls are resolved through LSP
+document/workspace symbols when an unambiguous definition is available.
+
+References are refreshed as follow-up answers arrive. If Tab or Enter in a full
+answer arrives before reference lookup finishes, navigation waits for the result;
+moving the cursor or closing/updating the answer cancels that pending action.
+File, line, and column targets are checked against loaded buffers (including
+unsaved content) or disk. Ambiguous filenames and invalid source locations are
+not guessed.
+
 The existing `require('ivan.claude').setup()` entry point still works. You can
 also configure it explicitly:
 
 ```lua
 require('ivan.claude').setup { backend = 'opencode', model = 'openai/gpt-5.4' }
 ```
+
+The hover shortcut and window can be configured separately:
+
+```lua
+require('ivan.claude').setup {
+  hover = {
+    key = 'H', -- Set to false to use only :AIHover or a custom mapping.
+    max_width = 72,
+    max_height = 12,
+    lsp_timeout_ms = 1500, -- Continue with available context if the LSP is slow.
+    cache_size = 128, -- Set to 0 to disable caching.
+  },
+}
+```
+
+For a custom mapping, call `require('ivan.ai_hover').hover()`.
 
 Explicit setup values override saved preferences on startup. Future CLI backends
 can be registered through `setup { backends = { name = adapter } }`. An adapter

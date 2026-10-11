@@ -5,15 +5,8 @@ local thinking_effort = 'high'
 local backends = { opencode = require 'ivan.opencode', claude = { label = 'Claude', default_model = default_model } }
 local namespace = vim.api.nvim_create_namespace 'ivan-claude'
 local pending_hl = 'DiffChange'
-local reference_hl = 'Underlined'
-local path_char_pattern = '[%w_%.%-/~@+]'
-local path_token_pattern = '()(' .. path_char_pattern .. '+)'
-local path_continues_pattern = '^%.?[%w_%-/]'
-local line_suffix_pattern = '^:(%d+)()'
-local bare_line_pattern = '()[Ll]ines? (%d+)()'
-local named_file_pattern = '^%s+[io][fn]%s+[`*_]*()'
+local references = require 'ivan.ai_references'
 local border_size = 2
-local location_list_title = 'AI references'
 
 local read_tools = 'Read,Glob,Grep'
 
@@ -74,9 +67,10 @@ local ask_system_prompt = sentences(
   'Every line is prefixed with its line number and a tab; that prefix is not part of the content.',
   'When the answer depends on code you were not given, such as definitions, callers or configuration elsewhere,',
   'search and read the project files with your tools.',
-  'Whenever you refer to a specific place, cite it as path:line (for example src/app.lua:42), never as a bare line number:',
+  'When citing a particular line, include the file path and line number, never a bare line number:',
   'for the given file use the path exactly as in the path attribute, for other files the path relative to the working directory.',
   'Answer the question directly and concisely in Markdown.',
+  references.prompt_rules,
   'A <conversation> may hold earlier questions with your answers; <instruction> is the follow-up to answer.'
 )
 
@@ -235,20 +229,6 @@ local function prompt_path(path, root)
   return vim.fs.relpath(root, path) or display_path(path)
 end
 
-local function path_aliases(path, root)
-  local display = display_path(path)
-  local aliases = vim
-    .iter({ prompt_path(path, root), display, path, vim.fs.basename(display) })
-    :filter(function(alias)
-      return alias ~= ''
-    end)
-    :totable()
-  table.sort(aliases, function(a, b)
-    return #a > #b
-  end)
-  return aliases
-end
-
 local function new_request(buf, range, kind, instruction)
   local path = vim.api.nvim_buf_get_name(buf)
   local filetype = vim.bo[buf].filetype
@@ -266,7 +246,6 @@ local function new_request(buf, range, kind, instruction)
     buffer_text = range_text(buf, whole_buffer),
     is_whole_buffer = vim.deep_equal(range, whole_buffer),
     path = prompt_path(path, root),
-    path_aliases = path_aliases(path, root),
     filetype = filetype ~= '' and filetype or 'text',
     first_line = range.start_row + 1,
     last_line = range.start_row + #split_lines(selection),
@@ -632,346 +611,6 @@ local function apply_edit(exchange)
   notify(done_message(exchange, other_files(request, marked)))
 end
 
-local function is_after(position, row, col)
-  return position.row > row or (position.row == row and position.start_col > col)
-end
-
-local function is_before(position, row, col)
-  return position.row < row or (position.row == row and position.start_col < col)
-end
-
-local function by_position(a, b)
-  return is_before(a, b.row, b.start_col)
-end
-
-local function readable_file(request, path)
-  local file = absolute_path(request, path)
-  return vim.fn.filereadable(file) == 1 and file or nil
-end
-
-local function request_buffer(request)
-  return vim.api.nvim_buf_is_valid(request.buf) and { bufnr = request.buf } or nil
-end
-
-local function file_target(request, path)
-  local file = readable_file(request, path)
-  if not file then
-    return nil
-  end
-  return vim.list_contains(request.path_aliases, file) and request_buffer(request) or { filename = file }
-end
-
-local function new_mention(target, row, line, start_col, path_end)
-  local line_number, suffix_end = line:sub(path_end):match(line_suffix_pattern)
-  return {
-    target = target,
-    row = row,
-    start_col = start_col,
-    path_end = path_end,
-    line_number = line_number,
-    end_col = suffix_end and path_end + suffix_end - 1,
-  }
-end
-
-local function is_standalone(line, start_col, path_end)
-  local char_before = line:sub(start_col - 1, start_col - 1)
-  return not char_before:match(path_char_pattern) and not line:sub(path_end):match(path_continues_pattern)
-end
-
-local function alias_mentions(request, row, line)
-  local target = request_buffer(request)
-  if not target then
-    return {}
-  end
-  return vim
-    .iter(request.path_aliases)
-    :map(function(alias)
-      return vim
-        .iter(line:gmatch('()' .. vim.pesc(alias) .. '()'))
-        :filter(function(start_col, path_end)
-          return is_standalone(line, start_col, path_end)
-        end)
-        :map(function(start_col, path_end)
-          return new_mention(target, row, line, start_col, path_end)
-        end)
-        :totable()
-    end)
-    :flatten()
-    :totable()
-end
-
-local function token_mention(request, row, line, start_col, token)
-  local path = token:gsub('%.+$', '')
-  local target = path:find '[/.]' and file_target(request, path)
-  if not target then
-    return nil
-  end
-  return new_mention(target, row, line, start_col, start_col + #path)
-end
-
-local function token_mentions(request, row, line)
-  return vim
-    .iter(line:gmatch(path_token_pattern))
-    :map(function(start_col, token)
-      return token_mention(request, row, line, start_col, token)
-    end)
-    :totable()
-end
-
-local function overlaps(a, b)
-  return a.row == b.row and a.start_col < b.path_end and b.start_col < a.path_end
-end
-
-local function add_unless_overlapping(kept, mention)
-  local is_taken = vim.iter(kept):any(function(other)
-    return overlaps(other, mention)
-  end)
-  return is_taken and kept or vim.list_extend({ mention }, kept)
-end
-
-local function line_mentions(request, row, line)
-  local candidates = vim.list_extend(alias_mentions(request, row, line), token_mentions(request, row, line))
-  local mentions = vim.iter(candidates):fold({}, add_unless_overlapping)
-  table.sort(mentions, by_position)
-  return mentions
-end
-
-local function is_line_in_buffer(buf, lnum)
-  return lnum >= 1 and lnum <= vim.api.nvim_buf_line_count(buf)
-end
-
-local function new_reference(target, row, line, start_col, end_col, line_number)
-  local lnum = tonumber(line_number)
-  if target.bufnr and not is_line_in_buffer(target.bufnr, lnum) then
-    return nil
-  end
-  return vim.tbl_extend('force', target, {
-    row = row,
-    start_col = start_col - 1,
-    end_col = end_col - 1,
-    lnum = lnum,
-    text = vim.trim(line),
-  })
-end
-
-local function citation_reference(lines, mention)
-  if not mention.line_number then
-    return nil
-  end
-  return new_reference(mention.target, mention.row, lines[mention.row + 1], mention.start_col, mention.end_col, mention.line_number)
-end
-
-local function named_mention(mentions, row, line, end_col)
-  local offset = line:sub(end_col):match(named_file_pattern)
-  local col = offset and end_col + offset - 1
-  return vim.iter(mentions):find(function(mention)
-    return mention.row == row and mention.start_col == col
-  end)
-end
-
-local function preceding_mention(mentions, row, col)
-  return vim.iter(mentions):rev():find(function(mention)
-    return is_before(mention, row, col)
-  end)
-end
-
-local function bare_line_target(request, mentions, row, line, start_col, end_col)
-  local mention = named_mention(mentions, row, line, end_col) or preceding_mention(mentions, row, start_col)
-  return mention and mention.target or request_buffer(request)
-end
-
-local function bare_line_references(request, mentions, row, line)
-  return vim
-    .iter(line:gmatch(bare_line_pattern))
-    :map(function(start_col, line_number, end_col)
-      local target = bare_line_target(request, mentions, row, line, start_col, end_col)
-      if not target then
-        return nil
-      end
-      return new_reference(target, row, line, start_col, end_col, line_number)
-    end)
-    :totable()
-end
-
-local function same_place(a, b)
-  return a.row == b.row and a.lnum == b.lnum and a.bufnr == b.bufnr and a.filename == b.filename
-end
-
-local function without_repeats(references, citations)
-  return vim
-    .iter(references)
-    :filter(function(reference)
-      return not vim.iter(citations):any(function(citation)
-        return same_place(citation, reference)
-      end)
-    end)
-    :totable()
-end
-
-local function flat_map_lines(lines, fn)
-  return vim
-    .iter(lines)
-    :enumerate()
-    :map(function(index, line)
-      return fn(index - 1, line)
-    end)
-    :flatten()
-    :totable()
-end
-
-local function find_references(request, lines)
-  local mentions = flat_map_lines(lines, function(row, line)
-    return line_mentions(request, row, line)
-  end)
-  local citations = vim
-    .iter(mentions)
-    :map(function(mention)
-      return citation_reference(lines, mention)
-    end)
-    :totable()
-  local bare = flat_map_lines(lines, function(row, line)
-    return bare_line_references(request, mentions, row, line)
-  end)
-  local references = vim.list_extend(without_repeats(bare, citations), citations)
-  table.sort(references, by_position)
-  return vim
-    .iter(references)
-    :enumerate()
-    :map(function(index, reference)
-      return vim.tbl_extend('force', reference, { index = index })
-    end)
-    :totable()
-end
-
-local function contains_cursor(reference, row, col)
-  return reference.row == row and col >= reference.start_col and col < reference.end_col
-end
-
-local function next_reference(references, row, col)
-  return vim.iter(references):find(function(reference)
-    return is_after(reference, row, col)
-  end) or references[1]
-end
-
-local function previous_reference(references, row, col)
-  return vim.iter(references):rev():find(function(reference)
-    return is_before(reference, row, col)
-  end) or references[#references]
-end
-
-local function reference_at(references, row, col)
-  return vim.iter(references):find(function(reference)
-    return contains_cursor(reference, row, col)
-  end)
-end
-
-local function location_item(reference)
-  return { bufnr = reference.bufnr, filename = reference.filename, lnum = reference.lnum, text = reference.text }
-end
-
-local function has_claude_list(win)
-  return vim.fn.getloclist(win, { title = 0 }).title == location_list_title
-end
-
-local function set_location_list(request, references)
-  if #references == 0 or not vim.api.nvim_win_is_valid(request.win) then
-    return
-  end
-  local items = vim.tbl_map(location_item, references)
-  vim.fn.setloclist(request.win, {}, has_claude_list(request.win) and 'r' or ' ', { title = location_list_title, items = items })
-end
-
-local function sync_location_list(request, reference)
-  if not has_claude_list(request.win) then
-    return
-  end
-  vim.fn.setloclist(request.win, {}, 'a', { idx = reference.index })
-end
-
-local function highlight_references(buf, references)
-  vim.iter(references):each(function(reference)
-    vim.api.nvim_buf_set_extmark(buf, namespace, reference.row, reference.start_col, { end_col = reference.end_col, hl_group = reference_hl })
-  end)
-end
-
-local function move_to_reference(win, reference)
-  vim.api.nvim_win_set_cursor(win, { reference.row + 1, reference.start_col })
-end
-
-local function reference_buffer(reference)
-  if reference.bufnr then
-    return vim.api.nvim_buf_is_valid(reference.bufnr) and reference.bufnr or nil
-  end
-  if vim.fn.filereadable(reference.filename) == 0 then
-    return nil
-  end
-  return load_buffer(reference.filename)
-end
-
-local function jump_problem(request, reference, buf)
-  if not vim.api.nvim_win_is_valid(request.win) then
-    return 'the window you asked from is gone'
-  end
-  if not buf then
-    return 'the referenced file no longer exists'
-  end
-  if not is_line_in_buffer(buf, reference.lnum) then
-    return string.format('line %d is past the end of the file', reference.lnum)
-  end
-  return nil
-end
-
-local function jump_to_reference(request, reference, float_win)
-  local buf = reference_buffer(reference)
-  local problem = jump_problem(request, reference, buf)
-  if problem then
-    return notify(problem, vim.log.levels.WARN)
-  end
-  move_to_reference(float_win, reference)
-  vim.api.nvim_win_close(float_win, true)
-  vim.api.nvim_set_current_win(request.win)
-  vim.cmd "normal! m'"
-  vim.bo[buf].buflisted = true
-  vim.api.nvim_win_set_buf(request.win, buf)
-  vim.api.nvim_win_set_cursor(request.win, { reference.lnum, 0 })
-  vim.cmd 'normal! zvzz'
-  sync_location_list(request, reference)
-end
-
-local function missing_reference_message(references)
-  if #references == 0 then
-    return 'this answer has no file references'
-  end
-  return 'the cursor is not on a reference (<Tab> moves to the next one)'
-end
-
-local function attach_references(request, buf, win, references)
-  local function on_reference(pick, action)
-    return function()
-      local cursor = vim.api.nvim_win_get_cursor(win)
-      local reference = pick(references, cursor[1] - 1, cursor[2])
-      if not reference then
-        return notify(missing_reference_message(references), vim.log.levels.WARN)
-      end
-      action(reference)
-    end
-  end
-  local function map(lhs, pick, action, desc)
-    vim.keymap.set('n', lhs, on_reference(pick, action), { buffer = buf, desc = desc })
-  end
-  local function move(reference)
-    move_to_reference(win, reference)
-  end
-
-  set_location_list(request, references)
-  highlight_references(buf, references)
-  map('<CR>', reference_at, function(reference)
-    jump_to_reference(request, reference, win)
-  end, 'Jump to AI reference')
-  map('<Tab>', next_reference, move, 'Next AI reference')
-  map('<S-Tab>', previous_reference, move, 'Previous AI reference')
-end
-
 local function answer_footer(answer, references)
   local reference_hints = #references > 0 and { '<CR> jump', '<Tab> next ref', ']l [l after jump' } or {}
   return ' '
@@ -1019,14 +658,20 @@ local function remember_view(answer, win)
 end
 
 local function open_answer(answer)
-  local references = find_references(answer.request, answer.lines)
-  local buf, win = open_float(answer.lines, ' ' .. backends[answer.backend].label .. ' · ' .. answer.model .. ' ', answer_footer(answer, references))
+  local buf, win = open_float(answer.lines, ' ' .. backends[answer.backend].label .. ' · ' .. answer.model .. ' ', answer_footer(answer, {}))
   vim.b[buf].claude_answer = true
   vim.api.nvim_win_call(win, function()
     vim.fn.winrestview(answer.view)
   end)
   remember_view(answer, win)
-  attach_references(answer.request, buf, win, references)
+  references.attach(answer.request, buf, win, {
+    on_update = function(resolved)
+      if not vim.api.nvim_win_is_valid(win) then
+        return
+      end
+      vim.api.nvim_win_set_config(win, { footer = answer_footer(answer, resolved) })
+    end,
+  })
 end
 
 local function answer_windows()
@@ -1099,40 +744,55 @@ local handlers = {
   },
 }
 
-local function run(request)
-  local handler = handlers[request.kind]
-  local model, thinking = state.model, state.thinking
-  local backend_name = state.backend
-  local backend = backends[backend_name]
-  state.last_request = request
-  set_mark_highlight(request, pending_hl)
-  notify(string.format('%s with %s · %s%s…', handler.label, backend.label, model, thinking and ' + thinking' or ''))
+local function current_profile()
+  return { backend = state.backend, label = backends[state.backend].label, model = state.model, thinking = state.thinking }
+end
 
+local function generate(handler, prompt, cwd, callback, profile)
+  profile = profile or current_profile()
+  local backend = backends[profile.backend]
   local on_exit = vim.schedule_wrap(function(result)
-    set_mark_highlight(request, nil)
-    local response, err = backend.parse(result, handler)
-    if not response then
-      return notify(err, vim.log.levels.ERROR)
+    local parsed, response, err = pcall(backend.parse, result, handler)
+    if not parsed then
+      return callback(nil, 'failed to parse ' .. backend.label .. ' response: ' .. tostring(response))
     end
-    state.last_exchange = vim.tbl_extend('force', response, { request = request, thinking = thinking, model = model, backend = backend_name })
-    handler.on_result(state.last_exchange)
+    callback(response and vim.tbl_extend('force', response, profile) or nil, err)
   end)
 
-  local command, options = backend.prepare(handler, model, thinking, build_prompt(request, handler.numbered))
-  local started, err = pcall(
+  local prepared, command, options = pcall(backend.prepare, handler, profile.model, profile.thinking, prompt)
+  if not prepared then
+    return callback(nil, 'failed to prepare ' .. backend.label .. ': ' .. tostring(command))
+  end
+  local started, job = pcall(
     vim.system,
     command,
     vim.tbl_extend('force', options, {
-      cwd = request.cwd,
+      cwd = cwd,
+      env = vim.tbl_extend('force', options.env or {}, { PWD = cwd }),
       text = true,
     }),
     on_exit
   )
   if started then
-    return
+    return job
   end
-  set_mark_highlight(request, nil)
-  notify('failed to start ' .. backend.label .. ': ' .. tostring(err), vim.log.levels.ERROR)
+  callback(nil, 'failed to start ' .. backend.label .. ': ' .. tostring(job))
+end
+
+local function run(request)
+  local handler = handlers[request.kind]
+  local profile = current_profile()
+  state.last_request = request
+  set_mark_highlight(request, pending_hl)
+  notify(string.format('%s with %s · %s%s…', handler.label, profile.label, profile.model, profile.thinking and ' + thinking' or ''))
+  generate(handler, build_prompt(request, handler.numbered), request.cwd, function(response, err)
+    set_mark_highlight(request, nil)
+    if not response then
+      return notify(err, vim.log.levels.ERROR)
+    end
+    state.last_exchange = vim.tbl_extend('force', response, { request = request })
+    handler.on_result(state.last_exchange)
+  end, profile)
 end
 
 local function ask_input(prompt, on_input)
@@ -1276,6 +936,7 @@ local function setup(opts)
   vim.keymap.set('n', '<leader>ct', toggle_thinking, { desc = 'AI [T]hinking on/off' })
   vim.keymap.set('n', '<leader>co', reopen_answer, { desc = 'AI re[O]pen last answer' })
   vim.keymap.set('n', '<leader>cm', select_model, { desc = 'AI select [M]odel' })
+  require('ivan.ai_hover').setup(vim.tbl_extend('force', opts.hover or {}, { generate = generate, profile = current_profile }))
 end
 
 return { setup = setup }
